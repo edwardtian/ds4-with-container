@@ -10,7 +10,7 @@ This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
 other contributors.
 
-Now, back at thsi project. Why we believe DeepSeek v4 Flash to be a pretty special
+Now, back at this project. Why we believe DeepSeek v4 Flash to be a pretty special
 model deserving a stand alone engine? Because after comparing it with powerful smaller
 dense models, we can report that:
 
@@ -29,7 +29,7 @@ That said, a few important things about this project:
 * This software is developed with **strong assistance from GPT 5.5** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
 * This implementation is based on the idea that compressed KV caches like the one of DeepSeek v4 and the fast SSD disks of modern MacBooks should change our idea that KV cache belongs to RAM. **The KV cache It is actually a first class disk citizen**.
 * Our vision is that local inference should be a set of three things working well together, out of the box: A) inference engine with HTTP API + B) GGUF specially crafted to run well under a given engine and given assumptions + C) testing and validation with coding agents implementations. This inference engine only runs with the GGUF files provided. It gets tested against officially obtained logits at different context sizes. This project exists because we wanted to make one local model feel finished end to end, not just runnable. However this is just alpha quality code, so probably we are not still there.
-* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virutal memory implementation that will crash the kernel** if you try to run the CPU code. Remeber? Software sucks. I was not possible to fix the CPU inference to avoid crashing, since each time there is to restart the computer, which is not funny. Help us, if you have the guts.
+* This is **Metal-only**, may implement CUDA support in the future? Perhaps, but nothing more. The CPU path is only for correctness check, but **warning: current macOS versions have a bug in the virtual memory implementation that will crash the kernel** if you try to run the CPU code. Remember? Software sucks. I was not possible to fix the CPU inference to avoid crashing, since each time there is to restart the computer, which is not funny. Help us, if you have the guts.
 
 ## Acknowledgements to llama.cpp and GGML
 
