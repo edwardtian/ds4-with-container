@@ -3489,39 +3489,30 @@ static double now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-typedef enum {
-    LOG_DEFAULT,
-    LOG_PREFILL,
-    LOG_GENERATION,
-    LOG_CACHE,
-    LOG_TOOL,
-} log_color;
-
-static const char *log_color_code(log_color color) {
-    switch (color) {
-    case LOG_PREFILL:    return "\033[36m";
-    case LOG_GENERATION: return "\033[32m";
-    case LOG_CACHE:      return "\033[33m";
-    case LOG_TOOL:       return "\033[90m";
-    default:             return "";
-    }
-}
-
-static void server_log(log_color color, const char *fmt, ...) {
+static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
     localtime_r(&now, &tm);
     char ts[16];
     strftime(ts, sizeof(ts), "%m%d %H:%M:%S", &tm);
 
-    const bool colorize = color != LOG_DEFAULT && isatty(STDERR_FILENO);
-    fprintf(stderr, "%s ", ts);
-    if (colorize) fputs(log_color_code(color), stderr);
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    va_list copy;
+    va_copy(copy, ap);
+    int n = vsnprintf(NULL, 0, fmt, copy);
+    va_end(copy);
+
+    fprintf(stderr, "%s ", ts);
+    if (n < 0) {
+        ds4_log(stderr, type, "%s", fmt);
+    } else {
+        char *line = xmalloc((size_t)n + 1);
+        vsnprintf(line, (size_t)n + 1, fmt, ap);
+        ds4_log(stderr, type, "%s", line);
+        free(line);
+    }
     va_end(ap);
-    if (colorize) fputs("\033[0m", stderr);
     fputc('\n', stderr);
 }
 
@@ -4016,7 +4007,7 @@ static void kv_cache_evict(kv_disk_cache *kc, const ds4_tokens *live) {
         }
         kv_entry e = kc->entry[victim];
         if (unlink(e.path) == 0) {
-            server_log(LOG_CACHE,
+            server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache evicted tokens=%u hits=%u size=%.2f MiB",
                        e.tokens, e.hits, (double)e.file_size / (1024.0 * 1024.0));
             if (total >= e.file_size) total -= e.file_size;
@@ -4036,7 +4027,7 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
     memset(kc, 0, sizeof(*kc));
     if (!dir) return false;
     if (!mkdir_p(dir)) {
-        server_log(LOG_DEFAULT, "ds4-server: failed to create KV cache directory %s: %s", dir, strerror(errno));
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create KV cache directory %s: %s", dir, strerror(errno));
         return false;
     }
     kc->enabled = true;
@@ -4046,7 +4037,7 @@ static bool kv_cache_open(kv_disk_cache *kc, const char *dir, uint64_t budget_mb
     kc->reject_different_quant = reject_different_quant;
     kc->opt = opt;
     kv_cache_evict(kc, NULL);
-    server_log(LOG_CACHE,
+    server_log(DS4_LOG_KVCACHE,
                "ds4-server: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d)",
                kc->dir,
                (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
@@ -4108,7 +4099,7 @@ static bool kv_cache_existing_compatible(kv_disk_cache *kc, const char *path, in
     kv_entry_free(&e);
     if (!compatible) {
         if (unlink(path) == 0) {
-            server_log(LOG_CACHE, "ds4-server: kv cache replaced incompatible file %s", path);
+            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache replaced incompatible file %s", path);
         }
         return false;
     }
@@ -4149,7 +4140,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
         live_tokens->len != store_tokens.len ||
         !ds4_tokens_starts_with(live_tokens, &store_tokens))
     {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache skipped tokens=%d reason=%s because live checkpoint is at %d",
                    store_tokens.len,
                    reason,
@@ -4169,7 +4160,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     size_t text_len = 0;
     char *text = render_tokens_text(s->engine, &store_tokens, &text_len);
     if (text_len > UINT32_MAX) {
-        server_log(LOG_CACHE, "ds4-server: kv cache skipped tokens=%d because rendered text is too large", store_tokens.len);
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache skipped tokens=%d because rendered text is too large", store_tokens.len);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -4182,7 +4173,7 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     const double save_t0 = now_sec();
     FILE *fp = fopen(tmp, "wb");
     if (!fp) {
-        server_log(LOG_CACHE, "ds4-server: kv cache failed to create %s: %s save=%.1f ms",
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache failed to create %s: %s save=%.1f ms",
                    tmp, strerror(errno), (now_sec() - save_t0) * 1000.0);
         free(tmp);
         free(text);
@@ -4214,13 +4205,13 @@ static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
     }
     const double save_ms = (now_sec() - save_t0) * 1000.0;
     if (!ok) {
-        server_log(LOG_CACHE, "ds4-server: kv cache store failed (%s): %s save=%.1f ms",
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache store failed (%s): %s save=%.1f ms",
                    reason,
                    saved_errno ? strerror(saved_errno) : (err[0] ? err : "unknown error"),
                    save_ms);
         unlink(tmp);
     } else {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache stored tokens=%d trimmed=%d reason=%s size=%.2f MiB save=%.1f ms",
                    store_tokens.len,
                    original_len - store_tokens.len,
@@ -4307,11 +4298,11 @@ static int kv_cache_try_load(server *s, const request *req, char **loaded_path_o
         } else {
             ds4_session_invalidate(s->session);
             unlink(path);
-            server_log(LOG_CACHE, "ds4-server: kv cache discarded corrupt token prefix %s", path);
+            server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache discarded corrupt token prefix %s", path);
         }
     } else {
         ds4_session_invalidate(s->session);
-        server_log(LOG_CACHE, "ds4-server: kv cache load failed %s: %s load=%.1f ms",
+        server_log(DS4_LOG_KVCACHE, "ds4-server: kv cache load failed %s: %s load=%.1f ms",
                    path,
                    header_ok ? err : "invalid header",
                    (now_sec() - load_t0) * 1000.0);
@@ -4324,12 +4315,12 @@ static int kv_cache_try_load(server *s, const request *req, char **loaded_path_o
         kc->continued_last_store_tokens = loaded;
         if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
             unlink(path);
-            server_log(LOG_CACHE,
+            server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache hit tokens=%d quant=%u load=%.1f ms consumed file=%s",
                        loaded, hdr.quant_bits, load_ms, path);
         } else {
             kv_cache_touch_file(path, hdr.hits + 1);
-            server_log(LOG_CACHE,
+            server_log(DS4_LOG_KVCACHE,
                        "ds4-server: kv cache hit tokens=%d quant=%u load=%.1f ms file=%s",
                        loaded, hdr.quant_bits, load_ms, path);
         }
@@ -4679,7 +4670,7 @@ static void log_decode_progress(req_kind kind, const char *ctx, int completion,
     const double avg_tps = elapsed > 0.0 ? (double)completion / elapsed : 0.0;
     char flags[80];
     log_flags(flags, sizeof(flags), tools, thinking, dsml_start, dsml_end);
-    server_log(LOG_GENERATION,
+    server_log(DS4_LOG_GENERATION,
                "ds4-server: %s ctx=%s gen=%d%s%s decoding chunk=%.2f t/s avg=%.2f t/s %.3fs",
                kind == REQ_CHAT ? "chat" : "completion",
                ctx,
@@ -4734,7 +4725,7 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls) {
         if (i) buf_putc(&names, ',');
         buf_puts(&names, calls->v[i].name ? calls->v[i].name : "?");
     }
-    server_log(LOG_TOOL,
+    server_log(DS4_LOG_TOOL,
                "ds4-server: tool calls ctx=%s n=%d names=[%s]",
                ctx,
                calls->len,
@@ -4769,7 +4760,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     p->seen = true;
     char flags[64];
     log_flags(flags, sizeof(flags), p->has_tools, false, false, false);
-    server_log(LOG_PREFILL,
+    server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prefill chunk %d/%d (%.1f%%) chunk=%.2f t/s avg=%.2f t/s %.3fs",
                p->kind == REQ_CHAT ? "chat" : "completion",
                p->ctx,
@@ -4829,14 +4820,14 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
     char err[160];
     ds4_session_rewind(s->session, common);
     if (ds4_session_sync(s->session, &canonical, err, sizeof(err)) == 0) {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
                    ctx, common, live_len, canonical.len);
         trace_event(s, trace_id,
                     "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
     } else {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
                    ctx, common, live_len, canonical.len, err);
         trace_event(s, trace_id, "tool checkpoint canonicalization failed: %s", err);
@@ -4900,7 +4891,7 @@ static void generate_job(server *s, job *j) {
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), j->req.has_tools, false, false, false);
-    server_log(LOG_PREFILL,
+    server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt start",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                ctx_span,
@@ -4944,7 +4935,7 @@ static void generate_job(server *s, job *j) {
         return;
     }
     ds4_session_set_progress(s->session, NULL, NULL);
-    server_log(LOG_PREFILL,
+    server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                ctx_span,
@@ -5250,7 +5241,7 @@ static void generate_job(server *s, job *j) {
                   saw_tool_start,
                   saw_tool_end);
         if (!strcmp(final_finish, "error") && err[0]) {
-            server_log(LOG_GENERATION,
+            server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        ctx_span,
                        completion,
@@ -5260,7 +5251,7 @@ static void generate_job(server *s, job *j) {
                        err,
                        now_sec() - t0);
         } else {
-            server_log(LOG_GENERATION,
+            server_log(DS4_LOG_GENERATION,
                        "ds4-server: chat ctx=%s gen=%d%s%s finish=%s %.3fs",
                        ctx_span,
                        completion,
@@ -5277,7 +5268,7 @@ static void generate_job(server *s, job *j) {
                   false,
                   false);
         if (!strcmp(final_finish, "error") && err[0]) {
-            server_log(LOG_GENERATION,
+            server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s error=\"%s\" %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
@@ -5288,7 +5279,7 @@ static void generate_job(server *s, job *j) {
                        err,
                        now_sec() - t0);
         } else {
-            server_log(LOG_GENERATION,
+            server_log(DS4_LOG_GENERATION,
                        "ds4-server: %s ctx=%s gen=%d%s%s finish=%s %.3fs",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
                        ctx_span,
@@ -5639,7 +5630,7 @@ static int parse_int_arg(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (!s[0] || *end || v <= 0 || v > INT_MAX) {
-        server_log(LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
         exit(2);
     }
     return (int)v;
@@ -5649,7 +5640,7 @@ static int parse_nonneg_int_arg(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (!s[0] || *end || v < 0 || v > INT_MAX) {
-        server_log(LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
         exit(2);
     }
     return (int)v;
@@ -5659,7 +5650,7 @@ static float parse_float_arg(const char *s, const char *opt, float minv, float m
     char *end = NULL;
     float v = strtof(s, &end);
     if (!s[0] || *end || v < minv || v > maxv) {
-        server_log(LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: invalid value for %s: %s", opt, s);
         exit(2);
     }
     return v;
@@ -5667,7 +5658,7 @@ static float parse_float_arg(const char *s, const char *opt, float minv, float m
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     if (*i + 1 >= argc) {
-        server_log(LOG_DEFAULT, "ds4-server: missing value for %s", opt);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: missing value for %s", opt);
         exit(2);
     }
     return argv[++(*i)];
@@ -5675,7 +5666,7 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
-    server_log(LOG_DEFAULT,
+    server_log(DS4_LOG_DEFAULT,
                "ds4-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
                (double)m.total_bytes / (1024.0 * 1024.0),
                ctx_size,
@@ -5837,10 +5828,10 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
-            server_log(LOG_DEFAULT, "ds4-server: server mode is Metal-only");
+            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
             exit(2);
         } else {
-            server_log(LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
+            server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
             exit(2);
         }
@@ -5848,7 +5839,7 @@ static server_config parse_options(int argc, char **argv) {
     if (c.kv_cache.cold_max_tokens > 0 &&
         c.kv_cache.cold_max_tokens < c.kv_cache.min_tokens)
     {
-        server_log(LOG_DEFAULT,
+        server_log(DS4_LOG_DEFAULT,
                    "ds4-server: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens");
         exit(2);
     }
@@ -5874,7 +5865,7 @@ int main(int argc, char **argv) {
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(LOG_DEFAULT, "ds4-server: failed to create Metal session");
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create Metal session");
         ds4_engine_close(engine);
         return 1;
     }
@@ -5895,13 +5886,13 @@ int main(int argc, char **argv) {
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
         if (!s.trace) {
-            server_log(LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to open trace file %s: %s",
                        cfg.trace_path, strerror(errno));
             server_close_resources(&s);
             return 1;
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
-        server_log(LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
 
     pthread_t worker;
@@ -5909,7 +5900,7 @@ int main(int argc, char **argv) {
 
     int lfd = listen_on(cfg.host, cfg.port);
     if (lfd < 0) {
-        server_log(LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
         pthread_mutex_lock(&s.mu);
         s.stopping = true;
         pthread_cond_broadcast(&s.cv);
@@ -5919,14 +5910,14 @@ int main(int argc, char **argv) {
         return 1;
     }
     g_listen_fd = lfd;
-    server_log(LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
     while (!g_stop_requested) {
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) {
             if (g_stop_requested) break;
             if (errno == EINTR) continue;
-            server_log(LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
+            server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s", strerror(errno));
             continue;
         }
         if (g_stop_requested) {
@@ -5958,7 +5949,7 @@ int main(int argc, char **argv) {
         g_listen_fd = -1;
     }
 
-    server_log(LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
     pthread_mutex_lock(&s.mu);
     s.stopping = true;
     pthread_cond_broadcast(&s.cv);
@@ -5970,7 +5961,7 @@ int main(int argc, char **argv) {
 
     const ds4_tokens *tokens = ds4_session_tokens(s.session);
     if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
-        server_log(LOG_CACHE,
+        server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
         kv_cache_store_current(&s, "shutdown");
