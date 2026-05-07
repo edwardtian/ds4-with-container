@@ -75,7 +75,7 @@
  *
  * DSR (Device Status Report)
  *    Sequence: ESC [ 6 n
- *    Effect: reports the current cusor position as ESC [ n ; m R
+ *    Effect: reports the current cursor position as ESC [ n ; m R
  *            where n is the row and m is the column
  *
  * When multi line mode is enabled, we also use an additional escape
@@ -754,7 +754,7 @@ static void refreshLineWithCompletion(struct linenoiseState *ls, linenoiseComple
  * If the function returns non-zero, the caller should handle the
  * returned value as a byte read from the standard input, and process
  * it as usually: this basically means that the function may return a byte
- * read from the termianl but not processed. Otherwise, if zero is returned,
+ * read from the terminal but not processed. Otherwise, if zero is returned,
  * the input was consumed by the completeLine() function to navigate the
  * possible completions, and the caller should read for the next characters
  * from stdin. */
