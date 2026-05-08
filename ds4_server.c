@@ -3429,6 +3429,15 @@ static bool openai_sse_finish_live(int fd, const request *r, const char *id,
     return ok;
 }
 
+static bool request_uses_openai_live_stream(const request *r) {
+    return r->stream && r->api == API_OPENAI && r->kind == REQ_CHAT;
+}
+
+static bool request_uses_structured_stream(const request *r) {
+    return r->stream && (r->api == API_ANTHROPIC ||
+                         request_uses_openai_live_stream(r));
+}
+
 static bool final_response(int fd, const request *r, const char *id, const char *text,
                            const char *reasoning, const tool_calls *calls, const char *finish,
                            int prompt_tokens, int completion_tokens) {
@@ -5352,14 +5361,10 @@ static void generate_job(server *s, job *j) {
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
              (unsigned long long)++s->seq);
 
-    bool structured_stream = j->req.stream &&
-        (j->req.api == API_ANTHROPIC || (j->req.kind == REQ_CHAT && j->req.has_tools));
+    bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
     openai_stream openai_live = {0};
-    const bool openai_live_tools = j->req.stream &&
-        j->req.api == API_OPENAI &&
-        j->req.kind == REQ_CHAT &&
-        j->req.has_tools;
+    const bool openai_live_chat = request_uses_openai_live_stream(&j->req);
     if (j->req.stream) {
         if (!sse_headers(j->fd)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: %s ctx=%s sse headers failed", j->req.kind == REQ_CHAT ? "chat" : "completion", ctx_span);
@@ -5376,7 +5381,7 @@ static void generate_job(server *s, job *j) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             return;
         }
-        if (openai_live_tools) openai_stream_start(&j->req, &openai_live);
+        if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
     }
 
     buf text = {0};
@@ -5503,7 +5508,7 @@ static void generate_job(server *s, job *j) {
                 stop_decode = true;
                 break;
             }
-            if (openai_live_tools &&
+            if (openai_live_chat &&
                 !openai_sse_stream_update(j->fd, &j->req, id,
                                           &openai_live, text.ptr, stream_len,
                                           false)) {
@@ -5641,7 +5646,7 @@ static void generate_job(server *s, job *j) {
             response_ok = anthropic_sse_finish_live(j->fd, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
                                                     &parsed_calls, final_finish, completion);
-        } else if (openai_live_tools) {
+        } else if (openai_live_chat) {
             response_ok = openai_sse_finish_live(j->fd, &j->req, id, &openai_live,
                                                  text.ptr ? text.ptr : "", text.len,
                                                  &parsed_calls, final_finish,
@@ -6598,6 +6603,59 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
 
     free(out);
     tool_calls_free(&calls);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.has_tools = false;
+
+    TEST_ASSERT(request_uses_structured_stream(&r));
+    TEST_ASSERT(request_uses_openai_live_stream(&r));
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_title", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw1 = "We need to generate a title";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_title", &st,
+                                         raw1, strlen(raw1), false));
+
+    const char *raw2 =
+        "We need to generate a title</think>Free disk space check";
+    TEST_ASSERT(openai_sse_finish_live(sv[0], &r, "chatcmpl_title", &st,
+                                       raw2, strlen(raw2), NULL,
+                                       "stop", 12, 8));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    const char *role = strstr(out, "\"role\":\"assistant\"");
+    const char *reasoning1 = strstr(out, "\"reasoning_content\":\"We need to generate \"");
+    const char *reasoning2 = strstr(out, "\"reasoning_content\":\"a title\"");
+    const char *content = strstr(out, "\"content\":\"Free disk space check\"");
+    const char *done = strstr(out, "data: [DONE]");
+    TEST_ASSERT(role != NULL);
+    TEST_ASSERT(reasoning1 != NULL);
+    TEST_ASSERT(reasoning2 != NULL);
+    TEST_ASSERT(content != NULL);
+    TEST_ASSERT(done != NULL);
+    TEST_ASSERT(role < reasoning1);
+    TEST_ASSERT(reasoning1 < reasoning2);
+    TEST_ASSERT(reasoning2 < content);
+    TEST_ASSERT(content < done);
+    TEST_ASSERT(strstr(out, "\"content\":\"We need to generate a title") == NULL);
+    TEST_ASSERT(strstr(out, "</think>") == NULL);
+
+    free(out);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -7576,6 +7634,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_thinking_and_tool_args_are_schema_ordered();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_openai_tool_stream_sends_incremental_text();
+    test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
