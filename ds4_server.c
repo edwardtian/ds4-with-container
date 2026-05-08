@@ -6753,6 +6753,145 @@ static void test_openai_tool_stream_sends_partial_raw_arguments(void) {
     close(sv[1]);
 }
 
+static void test_openai_tool_stream_holds_partial_dsml_entities(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw_partial =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo &amp";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_entity_tool", &st,
+                                         raw_partial, strlen(raw_partial), false));
+
+    const char *raw_complete =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">echo &amp; done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_entity_tool", &st,
+                                         raw_complete, strlen(raw_complete), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"arguments\":\"echo \"") != NULL);
+    TEST_ASSERT(strstr(out, "\"arguments\":\"& done\"") != NULL);
+    TEST_ASSERT(strstr(out, "&amp") == NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char prefix[] =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"write\">\n"
+        DS4_PARAM_START " name=\"content\" string=\"true\">flag ";
+    const char suffix[] =
+        " done" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    const char flag_utf8[] = {(char)0xf0, (char)0x9f, (char)0x9a, (char)0xa9, 0};
+    const char replacement[] = {(char)0xef, (char)0xbf, (char)0xbd, 0};
+
+    buf partial = {0};
+    buf_append(&partial, prefix, strlen(prefix));
+    buf_putc(&partial, (char)0xf0);
+    buf_putc(&partial, (char)0x9f);
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8_tool", &st,
+                                         partial.ptr, partial.len, false));
+
+    buf complete = {0};
+    buf_append(&complete, prefix, strlen(prefix));
+    buf_append(&complete, flag_utf8, 4);
+    buf_append(&complete, suffix, strlen(suffix));
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_utf8_tool", &st,
+                                         complete.ptr, complete.len, false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"arguments\":\"flag \"") != NULL);
+    TEST_ASSERT(strstr(out, flag_utf8) != NULL);
+    TEST_ASSERT(strstr(out, replacement) == NULL);
+
+    free(out);
+    buf_free(&partial);
+    buf_free(&complete);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_tool_stream_handles_multiple_calls(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        DS4_TOOL_CALLS_START "\n"
+        DS4_INVOKE_START " name=\"read\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">a.c" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_INVOKE_START " name=\"bash\">\n"
+        DS4_PARAM_START " name=\"command\" string=\"true\">wc -l a.c" DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+    TEST_ASSERT(openai_sse_stream_update(sv[0], &r, "chatcmpl_multi_tool", &st,
+                                         raw, strlen(raw), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "chatcmpl_multi_tool_tool_0") != NULL);
+    TEST_ASSERT(strstr(out, "chatcmpl_multi_tool_tool_1") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"read\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"path\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
+
+    free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 static void test_streaming_holds_partial_utf8(void) {
     const char partial[] = {'A', ' ', (char)0xf0, (char)0x9f, 0};
     const char complete[] = {'A', ' ', (char)0xf0, (char)0x9f,
@@ -7440,6 +7579,9 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
+    test_openai_tool_stream_holds_partial_dsml_entities();
+    test_openai_tool_stream_holds_partial_utf8_arguments();
+    test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
