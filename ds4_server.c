@@ -579,6 +579,7 @@ typedef struct {
     bool stream_include_usage;
     ds4_think_mode think_mode;
     bool has_tools;
+    bool prompt_preserves_reasoning;
     tool_replay_stats tool_replay;
 } request;
 
@@ -1883,12 +1884,26 @@ static bool role_is_user_like(const char *role) {
     return !strcmp(role, "user") || !strcmp(role, "tool") || !strcmp(role, "function");
 }
 
+static bool chat_history_uses_tool_context(const chat_msgs *msgs,
+                                           const char *tool_schemas) {
+    if (tool_schemas && tool_schemas[0]) return true;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if ((!strcmp(m->role, "assistant") && m->calls.len > 0) ||
+            !strcmp(m->role, "tool") || !strcmp(m->role, "function"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                      const tool_schema_orders *tool_orders,
                                      ds4_think_mode think_mode) {
     (void)tool_orders;
     const bool think = ds4_think_mode_enabled(think_mode);
-    bool tool_context = tool_schemas && tool_schemas[0];
+    const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
     int last_user_idx = -1;
     buf system = {0};
     for (int i = 0; i < msgs->len; i++) {
@@ -1900,11 +1915,6 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
     for (int i = 0; i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (role_is_user_like(m->role)) last_user_idx = i;
-        if ((!strcmp(m->role, "assistant") && m->calls.len > 0) ||
-            !strcmp(m->role, "tool") || !strcmp(m->role, "function"))
-        {
-            tool_context = true;
-        }
     }
 
     if (tool_schemas && tool_schemas[0]) {
@@ -2124,7 +2134,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    r->prompt_preserves_reasoning =
+        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
@@ -2319,7 +2332,10 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
-    r->prompt_text = render_chat_prompt_text(&msgs, r->has_tools ? tool_schemas : NULL,
+    const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    r->prompt_preserves_reasoning =
+        chat_history_uses_tool_context(&msgs, active_tool_schemas);
+    r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
@@ -6633,6 +6649,114 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
+/* In thinking mode without tools, old assistant reasoning is intentionally not
+ * rendered back into later prompts.  The sampled live graph still contains the
+ * reasoning bytes, so the next request would miss the session cache even though
+ * the conversation prefix is logically the same.  Rewrite the finished turn to
+ * the exact toolless history form that render_chat_prompt_text() will produce:
+ *
+ *   prompt-without-final-<think> + </think> + visible-content + eos
+ *
+ * This is the same policy the prompt renderer already applies.  The only goal
+ * here is to make the live checkpoint match that policy before the next turn. */
+static void canonicalize_thinking_checkpoint(server *s, const job *j, const char *ctx,
+                                             uint64_t trace_id, const char *content) {
+    if (!j->req.prompt_text) return;
+    if (!ds4_think_mode_enabled(j->req.think_mode)) return;
+
+    size_t pt_len = strlen(j->req.prompt_text);
+    const char *think_tag = "<think>";
+    size_t tag_len = strlen(think_tag);
+    if (pt_len < tag_len ||
+        memcmp(j->req.prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
+        return;
+    }
+
+    buf stable_prefix = {0};
+    buf_append(&stable_prefix, j->req.prompt_text, pt_len - tag_len);
+
+    buf rendered = {0};
+    buf_puts(&rendered, stable_prefix.ptr ? stable_prefix.ptr : "");
+    buf_puts(&rendered, "</think>");
+    buf_puts(&rendered, content ? content : "");
+    buf_puts(&rendered, "<｜end▁of▁sentence｜>");
+
+    ds4_tokens stable = {0};
+    ds4_tokens canonical = {0};
+    ds4_tokenize_rendered_chat(s->engine, stable_prefix.ptr ? stable_prefix.ptr : "", &stable);
+    ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
+    const int live_len = ds4_session_pos(s->session);
+    const int common = ds4_session_common_prefix(s->session, &canonical);
+    if (common == live_len && canonical.len == live_len) goto done;
+
+    if (common < stable.len) {
+        trace_event(s, trace_id,
+                    "thinking checkpoint canonicalization skipped: common=%d stable=%d live=%d canonical=%d",
+                    common, stable.len, live_len, canonical.len);
+        goto done;
+    }
+
+    char err[160] = {0};
+    ds4_session_rewrite_result rr =
+        ds4_session_rewrite_from_common(s->session, &canonical, common,
+                                        err, sizeof(err));
+    if (rr == DS4_SESSION_REWRITE_OK) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: thinking checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
+                   ctx, common, live_len, canonical.len);
+        trace_event(s, trace_id,
+                    "thinking checkpoint canonicalized: common=%d live=%d canonical=%d",
+                    common, live_len, canonical.len);
+    } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: thinking checkpoint canonicalization needs rebuild ctx=%s common=%d live=%d canonical=%d reason=\"%s\"",
+                   ctx, common, live_len, canonical.len, err);
+        char *path = NULL;
+        ds4_tokens effective = {0};
+        int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
+                                            &effective, &path);
+        if (loaded == 0) ds4_session_invalidate(s->session);
+
+        char sync_err[160] = {0};
+        const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
+        if (ds4_session_sync(s->session, sync_prompt, sync_err, sizeof(sync_err)) == 0) {
+            if (loaded > 0) {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: thinking checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=disk cached=%d",
+                           ctx, common, live_len, canonical.len, loaded);
+                trace_event(s, trace_id,
+                            "thinking checkpoint canonicalized via disk: common=%d live=%d canonical=%d cached=%d file=%s",
+                            common, live_len, canonical.len, loaded, path ? path : "");
+            } else {
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: thinking checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d via=rebuild",
+                           ctx, common, live_len, canonical.len);
+                trace_event(s, trace_id,
+                            "thinking checkpoint canonicalized via rebuild: common=%d live=%d canonical=%d reason=%s",
+                            common, live_len, canonical.len, err);
+            }
+        } else {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: thinking checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
+                       ctx, common, live_len, canonical.len, sync_err);
+            trace_event(s, trace_id, "thinking checkpoint canonicalization failed after rebuild request: %s", sync_err);
+        }
+        ds4_tokens_free(&effective);
+        free(path);
+    } else {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: thinking checkpoint canonicalization failed ctx=%s common=%d live=%d canonical=%d error=\"%s\"",
+                   ctx, common, live_len, canonical.len, err);
+        trace_event(s, trace_id, "thinking checkpoint canonicalization failed: %s", err);
+    }
+
+done:
+    ds4_tokens_free(&stable);
+    ds4_tokens_free(&canonical);
+    buf_free(&stable_prefix);
+    buf_free(&rendered);
+}
+
 /* After a successful tool-call finish, make the live checkpoint match what the
  * next request will render.  Usually that is just the exact DSML remembered by
  * tool id.  If a client sends a tool call without an id we know, the fallback
@@ -7176,6 +7300,12 @@ static void generate_job(server *s, job *j) {
         canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
+    } else if (j->req.kind == REQ_CHAT && !parsed_calls.len &&
+               !j->req.prompt_preserves_reasoning &&
+               ds4_think_mode_enabled(j->req.think_mode) &&
+               strcmp(final_finish, "error") != 0) {
+        canonicalize_thinking_checkpoint(s, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "");
     }
 
     if (j->req.stream) {
@@ -8693,6 +8823,12 @@ static void test_render_preserves_reasoning_with_tools(void) {
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
     TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
+    free(prompt);
+
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(prompt != NULL);
+    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<tool_result>/tmp</tool_result>") != NULL);
 
     free(prompt);
     chat_msgs_free(&msgs);
@@ -9716,6 +9852,258 @@ static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     rmdir(dir);
 }
 
+static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
+    /* Simulate: user sends a single message, thinking mode on, no tools.
+     * Model generates reasoning + content.  The next request will drop the
+     * reasoning from this turn.  Verify that:
+     *   prompt_text[:-len("<think>")] + "</think>" + content + "<|eos|>"
+     * equals what render_chat_prompt_text produces for the history. */
+
+    chat_msgs prefix_msgs = {0};
+    chat_msg user1 = {0};
+    user1.role = xstrdup("user");
+    user1.content = xstrdup("What is 2+2?");
+    chat_msgs_push(&prefix_msgs, user1);
+
+    /* This is what prompt_text looks like for the first generation */
+    char *prompt_text = render_chat_prompt_text(&prefix_msgs, NULL, NULL, DS4_THINK_HIGH);
+    /* prompt_text should end with <think> */
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(pt_len >= 7);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    /* The model generates: reasoning + </think> + content */
+    const char *reasoning = "Let me think... 2+2 = 4";
+    const char *content = "The answer is 4.";
+
+    /* Build the canonical checkpoint text (what we'd produce after canonicalization) */
+    buf canonical = {0};
+    buf_append(&canonical, prompt_text, pt_len - 7);  /* strip <think> */
+    buf_puts(&canonical, "</think>");
+    buf_puts(&canonical, content);
+    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+
+    /* Now build what the NEXT request would render: history includes this
+     * assistant message, plus a new user message.  Extract just the prefix
+     * up to and including the eos of the assistant turn. */
+    chat_msgs history_msgs = {0};
+    chat_msg h_user1 = {0};
+    h_user1.role = xstrdup("user");
+    h_user1.content = xstrdup("What is 2+2?");
+    chat_msgs_push(&history_msgs, h_user1);
+    chat_msg h_asst = {0};
+    h_asst.role = xstrdup("assistant");
+    h_asst.reasoning = xstrdup(reasoning);
+    h_asst.content = xstrdup(content);
+    chat_msgs_push(&history_msgs, h_asst);
+    chat_msg h_user2 = {0};
+    h_user2.role = xstrdup("user");
+    h_user2.content = xstrdup("Thanks!");
+    chat_msgs_push(&history_msgs, h_user2);
+
+    char *future_prompt = render_chat_prompt_text(&history_msgs, NULL, NULL, DS4_THINK_HIGH);
+
+    /* The future prompt should START with our canonical text */
+    size_t clen = canonical.len;
+    TEST_ASSERT(strlen(future_prompt) > clen);
+    TEST_ASSERT(!memcmp(future_prompt, canonical.ptr, clen));
+
+    /* And what comes after is the new user turn + assistant prefix */
+    const char *rest = future_prompt + clen;
+    TEST_ASSERT(strstr(rest, "Thanks!") != NULL);
+    TEST_ASSERT(strstr(rest, "<think>") != NULL);  /* new turn starts thinking */
+
+    /* Verify reasoning is NOT in the future prompt for this turn */
+    const char *asst_turn = strstr(future_prompt, "<" "\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c" ">");
+    TEST_ASSERT(asst_turn != NULL);
+    TEST_ASSERT(strstr(future_prompt, reasoning) == NULL);  /* reasoning dropped */
+
+    free(future_prompt);
+    buf_free(&canonical);
+    free(prompt_text);
+    chat_msgs_free(&prefix_msgs);
+    chat_msgs_free(&history_msgs);
+}
+
+static void test_thinking_canonical_empty_content(void) {
+    /* Edge case: model thinks but produces empty content (e.g. tool-less
+     * thinking where answer is entirely in reasoning).  Canonical should
+     * still be valid: prompt_text[:-7] + "</think><|eos|>" */
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Think about life");
+    chat_msgs_push(&msgs, user);
+
+    char *prompt_text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+
+    /* Build canonical with empty content */
+    buf canonical = {0};
+    buf_append(&canonical, prompt_text, pt_len - 7);
+    buf_puts(&canonical, "</think>");
+    /* empty content */
+    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+
+    /* Future prompt with empty content assistant message */
+    chat_msgs history = {0};
+    chat_msg h_u = {0};
+    h_u.role = xstrdup("user");
+    h_u.content = xstrdup("Think about life");
+    chat_msgs_push(&history, h_u);
+    chat_msg h_a = {0};
+    h_a.role = xstrdup("assistant");
+    h_a.reasoning = xstrdup("Deep thoughts about existence...");
+    h_a.content = xstrdup("");
+    chat_msgs_push(&history, h_a);
+    chat_msg h_u2 = {0};
+    h_u2.role = xstrdup("user");
+    h_u2.content = xstrdup("Continue");
+    chat_msgs_push(&history, h_u2);
+
+    char *future = render_chat_prompt_text(&history, NULL, NULL, DS4_THINK_HIGH);
+    TEST_ASSERT(strlen(future) > canonical.len);
+    TEST_ASSERT(!memcmp(future, canonical.ptr, canonical.len));
+    /* reasoning dropped */
+    TEST_ASSERT(strstr(future, "Deep thoughts") == NULL);
+
+    free(future);
+    buf_free(&canonical);
+    free(prompt_text);
+    chat_msgs_free(&msgs);
+    chat_msgs_free(&history);
+}
+
+static void test_thinking_canonical_multi_turn(void) {
+    /* Multi-turn: 3 user messages, 2 assistant responses with reasoning.
+     * Both prior assistant turns should have reasoning dropped.
+     * The canonical after the SECOND generation should produce text that
+     * matches the start of a 3rd-turn future prompt. */
+    chat_msgs turn2_prefix = {0};
+    chat_msg u1 = {0};
+    u1.role = xstrdup("user");
+    u1.content = xstrdup("Hello");
+    chat_msgs_push(&turn2_prefix, u1);
+    chat_msg a1 = {0};
+    a1.role = xstrdup("assistant");
+    a1.reasoning = xstrdup("first reasoning");
+    a1.content = xstrdup("Hi there");
+    chat_msgs_push(&turn2_prefix, a1);
+    chat_msg u2 = {0};
+    u2.role = xstrdup("user");
+    u2.content = xstrdup("How are you?");
+    chat_msgs_push(&turn2_prefix, u2);
+
+    /* prompt_text for the 2nd generation (includes 1st assistant turn) */
+    char *prompt_text = render_chat_prompt_text(&turn2_prefix, NULL, NULL, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    /* 1st turn reasoning is already dropped in this prompt_text */
+    TEST_ASSERT(strstr(prompt_text, "first reasoning") == NULL);
+    TEST_ASSERT(strstr(prompt_text, "Hi there") != NULL);
+
+    /* After 2nd generation: canonical drops 2nd reasoning too */
+    const char *content2 = "I'm doing well";
+    buf canonical = {0};
+    buf_append(&canonical, prompt_text, pt_len - 7);
+    buf_puts(&canonical, "</think>");
+    buf_puts(&canonical, content2);
+    buf_puts(&canonical, "<" "\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c" ">");
+
+    /* Future: 3rd user message arrives */
+    chat_msgs future_msgs = {0};
+    chat_msg fu1 = {0}; fu1.role = xstrdup("user"); fu1.content = xstrdup("Hello");
+    chat_msgs_push(&future_msgs, fu1);
+    chat_msg fa1 = {0}; fa1.role = xstrdup("assistant");
+    fa1.reasoning = xstrdup("first reasoning");
+    fa1.content = xstrdup("Hi there");
+    chat_msgs_push(&future_msgs, fa1);
+    chat_msg fu2 = {0}; fu2.role = xstrdup("user"); fu2.content = xstrdup("How are you?");
+    chat_msgs_push(&future_msgs, fu2);
+    chat_msg fa2 = {0}; fa2.role = xstrdup("assistant");
+    fa2.reasoning = xstrdup("second reasoning");
+    fa2.content = xstrdup(content2);
+    chat_msgs_push(&future_msgs, fa2);
+    chat_msg fu3 = {0}; fu3.role = xstrdup("user"); fu3.content = xstrdup("Great");
+    chat_msgs_push(&future_msgs, fu3);
+
+    char *future = render_chat_prompt_text(&future_msgs, NULL, NULL, DS4_THINK_HIGH);
+    /* Both reasonings dropped */
+    TEST_ASSERT(strstr(future, "first reasoning") == NULL);
+    TEST_ASSERT(strstr(future, "second reasoning") == NULL);
+    /* Canonical is a prefix of future */
+    TEST_ASSERT(strlen(future) > canonical.len);
+    TEST_ASSERT(!memcmp(future, canonical.ptr, canonical.len));
+
+    free(future);
+    buf_free(&canonical);
+    free(prompt_text);
+    chat_msgs_free(&turn2_prefix);
+    chat_msgs_free(&future_msgs);
+}
+
+static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
+    /* When tools ARE present, reasoning is preserved in re-render.
+     * The thinking canonicalization should NOT fire (has_tools gate),
+     * and the tool canonicalization handles it.  Verify the template
+     * preserves reasoning when tool_context is true. */
+    const char *tool_schemas = "{\"name\":\"bash\"}";
+
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("run ls");
+    chat_msgs_push(&msgs, u);
+
+    char *prompt_text = render_chat_prompt_text(&msgs, tool_schemas, NULL, DS4_THINK_HIGH);
+    size_t pt_len = strlen(prompt_text);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 7, "<think>", 7));
+
+    /* With tools, next render KEEPS reasoning */
+    chat_msgs history = {0};
+    chat_msg hu = {0}; hu.role = xstrdup("user"); hu.content = xstrdup("run ls");
+    chat_msgs_push(&history, hu);
+    chat_msg ha = {0}; ha.role = xstrdup("assistant");
+    ha.reasoning = xstrdup("I should run bash");
+    ha.content = xstrdup("Here you go");
+    chat_msgs_push(&history, ha);
+    chat_msg hu2 = {0}; hu2.role = xstrdup("user"); hu2.content = xstrdup("thanks");
+    chat_msgs_push(&history, hu2);
+
+    char *future = render_chat_prompt_text(&history, tool_schemas, NULL, DS4_THINK_HIGH);
+    /* Reasoning IS preserved when tools present */
+    TEST_ASSERT(strstr(future, "I should run bash") != NULL);
+    TEST_ASSERT(strstr(future, "<think>I should run bash</think>") != NULL);
+
+    free(future);
+    free(prompt_text);
+    chat_msgs_free(&msgs);
+    chat_msgs_free(&history);
+}
+
+static void test_thinking_canonical_non_thinking_mode_noop(void) {
+    /* When thinking is disabled (deepseek-chat), prompt_text ends with
+     * </think> not <think>.  The canonicalization should be a no-op
+     * (early return on memcmp check). */
+    chat_msgs msgs = {0};
+    chat_msg u = {0};
+    u.role = xstrdup("user");
+    u.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, u);
+
+    char *prompt_text = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE);
+    size_t pt_len = strlen(prompt_text);
+    /* Should end with </think>, not <think> */
+    TEST_ASSERT(pt_len >= 8);
+    TEST_ASSERT(!memcmp(prompt_text + pt_len - 8, "</think>", 8));
+    /* Does NOT end with <think> */
+    TEST_ASSERT(memcmp(prompt_text + pt_len - 7, "<think>", 7) != 0);
+
+    free(prompt_text);
+    chat_msgs_free(&msgs);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_match_deepseek_api();
     test_reasoning_effort_mapping();
@@ -9749,6 +10137,11 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
     test_kv_tool_map_restores_before_prompt_render();
+    test_thinking_checkpoint_canonical_matches_future_prompt();
+    test_thinking_canonical_empty_content();
+    test_thinking_canonical_multi_turn();
+    test_thinking_canonical_with_tools_preserves_reasoning();
+    test_thinking_canonical_non_thinking_mode_noop();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();
