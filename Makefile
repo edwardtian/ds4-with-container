@@ -12,8 +12,12 @@ METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_metal.o
 NATIVE_CORE_OBJS = ds4_native.o
 else
-CFLAGS += -DDS4_NO_METAL
-CORE_OBJS = ds4.o
+CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+NVCCFLAGS ?= -O3 --use_fast_math -Xcompiler -mcpu=native -Xcompiler -pthread
+CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+CORE_OBJS = ds4.o ds4_cuda.o
 NATIVE_CORE_OBJS = ds4_native.o
 METAL_LDLIBS := $(LDLIBS)
 endif
@@ -33,10 +37,10 @@ ds4_native: ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS) $(NATIVE_LDLIBS)
 else
 ds4: ds4_cli.o linenoise.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4-server: ds4_server.o rax.o $(CORE_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_native: ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ ds4_cli_native.o linenoise.o $(NATIVE_CORE_OBJS) $(LDLIBS)
@@ -69,8 +73,15 @@ ds4_cli_native.o: ds4_cli.c ds4.h linenoise.h
 ds4_metal.o: ds4_metal.m ds4_metal.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
+ds4_cuda.o: ds4_cuda.cu ds4_metal.h ds4_iq2_tables_cuda.inc
+	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
+
 ds4_test: ds4_test.o rax.o $(CORE_OBJS)
+ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
+else
+	$(NVCC) $(NVCCFLAGS) -o $@ ds4_test.o rax.o $(CORE_OBJS) $(CUDA_LDLIBS)
+endif
 
 test: ds4_test
 	./ds4_test

@@ -4392,6 +4392,11 @@ int ds4_metal_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_metal_set_model_map_range(model_map, model_size, 0, model_size);
 }
 
+int ds4_metal_set_model_fd(int fd) {
+    (void)fd;
+    return 1;
+}
+
 static id<MTLBuffer> ds4_metal_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,

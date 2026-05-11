@@ -70,6 +70,10 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * asks for a reasoning budget the allocated context is not meant to hold. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
+static bool ds4_backend_uses_graph(ds4_backend backend) {
+    return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
+}
+
 /* =========================================================================
  * Fixed DeepSeek V4 Flash Shape.
  * =========================================================================
@@ -1328,6 +1332,132 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
     }
     return NULL;
 }
+
+#ifndef DS4_NO_METAL
+#ifndef __APPLE__
+typedef struct {
+    uint64_t off;
+    uint64_t end;
+} accelerator_tensor_span;
+
+static int accelerator_tensor_span_cmp(const void *a, const void *b) {
+    const accelerator_tensor_span *sa = a;
+    const accelerator_tensor_span *sb = b;
+    if (sa->off < sb->off) return -1;
+    if (sa->off > sb->off) return 1;
+    if (sa->end < sb->end) return -1;
+    if (sa->end > sb->end) return 1;
+    return 0;
+}
+
+static uint64_t accelerator_cuda_preload_span_bytes(void) {
+    uint64_t mb = 1024;
+    const char *env = getenv("DS4_CUDA_WEIGHT_PRELOAD_SPAN_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && v > 0) mb = (uint64_t)v;
+    }
+    if (mb < 64) mb = 64;
+    if (mb > 4096) mb = 4096;
+    return mb * 1048576ull;
+}
+
+static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
+    accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
+    uint64_t nspan = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) continue;
+        if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
+            free(spans);
+            return false;
+        }
+        spans[nspan++] = (accelerator_tensor_span){
+            .off = t->abs_offset,
+            .end = t->abs_offset + t->bytes,
+        };
+    }
+    qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
+
+    const uint64_t max_span = accelerator_cuda_preload_span_bytes();
+    uint64_t cached = 0;
+    uint64_t merged = 0;
+    for (uint64_t i = 0; i < nspan;) {
+        uint64_t off = spans[i].off;
+        uint64_t end = spans[i].end;
+        i++;
+        while (i < nspan && spans[i].off <= end + 65536u && spans[i].end - off <= max_span) {
+            if (spans[i].end > end) end = spans[i].end;
+            i++;
+        }
+        while (off < end) {
+            uint64_t chunk_end = end;
+            if (chunk_end - off > max_span) chunk_end = off + max_span;
+            char label[96];
+            snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
+            if (ds4_metal_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
+                fprintf(stderr,
+                        "ds4: accelerator failed to cache model tensor span %" PRIu64
+                        " at offset %" PRIu64 "\n",
+                        merged, off);
+                free(spans);
+                return false;
+            }
+            cached += chunk_end - off;
+            merged++;
+            off = chunk_end;
+        }
+    }
+    free(spans);
+    if (cached_out) *cached_out = cached;
+    return true;
+}
+
+static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+    if (backend != DS4_BACKEND_CUDA) return true;
+    if (!m || !m->map || m->size == 0) return false;
+    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+        return true;
+    }
+
+    const double t0 = now_sec();
+    uint64_t cached = 0;
+    if (!accelerator_cache_model_tensor_spans(m, &cached)) return false;
+    if (getenv("DS4_CUDA_Q8_F16_PRELOAD") != NULL ||
+        getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL) {
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            const ds4_tensor *t = &m->tensors[i];
+            if (t->bytes == 0) continue;
+            if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) return false;
+            char label[128];
+            snprintf(label, sizeof(label), "tensor:%.*s", (int)t->name.len, t->name.ptr);
+            if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
+                ds4_metal_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
+                fprintf(stderr, "ds4: accelerator failed to cache dequantized Q8 tensor %.*s\n",
+                        (int)t->name.len, t->name.ptr);
+                return false;
+            }
+        }
+    }
+    if (cached != 0) {
+        const double t1 = now_sec();
+        if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
+        fprintf(stderr,
+                "ds4: CUDA startup model cache prepared %.2f GiB of tensor spans in %.3fs\n",
+                (double)cached / 1073741824.0,
+                t1 - t0);
+    }
+    return true;
+}
+#else
+static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model *m) {
+    (void)backend;
+    (void)m;
+    return true;
+}
+#endif
+#endif
 
 /* Return the in-place tensor payload inside the mapped GGUF. */
 static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
@@ -13298,7 +13428,7 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
 
-    if (backend == DS4_BACKEND_METAL) {
+    if (ds4_backend_uses_graph(backend)) {
         m.prefill_cap = metal_graph_prefill_cap_for_prompt((int)ctx);
         m.raw_cap = metal_graph_raw_cap_for_context((int)ctx, m.prefill_cap);
 
@@ -14838,7 +14968,12 @@ ds4_context_memory ds4_context_memory_estimate(ds4_backend backend, int ctx_size
  */
 
 const char *ds4_backend_name(ds4_backend backend) {
-    return backend == DS4_BACKEND_METAL ? "metal" : "cpu";
+    switch (backend) {
+    case DS4_BACKEND_METAL: return "metal";
+    case DS4_BACKEND_CUDA:  return "cuda";
+    case DS4_BACKEND_CPU:   return "cpu";
+    }
+    return "unknown";
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
@@ -15644,10 +15779,11 @@ int ds4_engine_generate_argmax(
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
 
-    if (e->backend == DS4_BACKEND_METAL) {
+    if (ds4_backend_uses_graph(e->backend)) {
 #ifndef DS4_NO_METAL
         if (!e->metal_ready) {
-            fprintf(stderr, "ds4: Metal generation requested but Metal is unavailable\n");
+            fprintf(stderr, "ds4: %s generation requested but the graph backend is unavailable\n",
+                    ds4_backend_name(e->backend));
             return 1;
         }
         return generate_metal_graph_raw_swa(model, vocab, weights, prompt,
@@ -15658,7 +15794,8 @@ int ds4_engine_generate_argmax(
                                             emit, done, emit_ud,
                                             progress, progress_ud);
 #else
-        fprintf(stderr, "ds4: Metal generation requested but this build has no Metal support\n");
+        fprintf(stderr, "ds4: %s generation requested but this build has no graph backend support\n",
+                ds4_backend_name(e->backend));
         return 1;
 #endif
     }
@@ -15877,15 +16014,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
-    model_open(&e->model, opt->model_path,
-               opt->backend == DS4_BACKEND_METAL, true);
+    const bool graph_backend = ds4_backend_uses_graph(opt->backend);
+    model_open(&e->model, opt->model_path, graph_backend, true);
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     if (opt->mtp_path && opt->mtp_path[0]) {
-        model_open(&e->mtp_model, opt->mtp_path,
-                   opt->backend == DS4_BACKEND_METAL, true);
+        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
@@ -15894,23 +16030,42 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 
 #ifndef DS4_NO_METAL
+    if (e->backend == DS4_BACKEND_CUDA) {
+#ifdef __APPLE__
+        fprintf(stderr, "ds4: CUDA backend requested but this build is linked with Metal, not CUDA\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
+    }
     if (e->backend == DS4_BACKEND_METAL) {
+#ifndef __APPLE__
+        fprintf(stderr, "ds4: Metal backend requested but this build is linked with CUDA, not Metal\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+#endif
+    }
+    if (graph_backend) {
         e->metal_ready = ds4_metal_init() != 0;
         if (!e->metal_ready) {
-            fprintf(stderr, "ds4: Metal backend unavailable; aborting startup\n");
+            fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
+                    ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
         ds4_metal_set_quality(e->quality);
+        (void)ds4_metal_set_model_fd(e->model.fd);
         if (!ds4_metal_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,
                                            e->model.size - e->model.tensor_data_pos))
         {
             fprintf(stderr,
-                    "ds4: Metal failed to map model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or Metal VM budget.\n");
+                    "ds4: %s failed to map model views; aborting startup. "
+                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+                    ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -15922,17 +16077,27 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                                            e->mtp_model.size - e->mtp_model.tensor_data_pos))
         {
             fprintf(stderr,
-                    "ds4: Metal failed to map MTP model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or Metal VM budget.\n");
+                    "ds4: %s failed to map MTP model views; aborting startup. "
+                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+                    ds4_backend_name(e->backend));
             ds4_engine_close(e);
             *out = NULL;
             return 1;
         }
-        fprintf(stderr, "ds4: Metal backend initialized for graph diagnostics\n");
+        if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
+            fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
+                    ds4_backend_name(e->backend));
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
+                ds4_backend_name(e->backend));
     }
 #else
-    if (e->backend == DS4_BACKEND_METAL) {
-        fprintf(stderr, "ds4: Metal backend requested but this build has no Metal support; aborting startup\n");
+    if (graph_backend) {
+        fprintf(stderr, "ds4: %s backend requested but this build has no graph backend support; aborting startup\n",
+                ds4_backend_name(e->backend));
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -15969,7 +16134,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     (void)ctx_size;
     return 1;
 #else
-    if (e->backend != DS4_BACKEND_METAL || !e->metal_ready) return 1;
+    if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;

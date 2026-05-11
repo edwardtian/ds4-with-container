@@ -7893,6 +7893,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
+        "  --metal | --cuda | --backend NAME\n"
+        "      Select graph backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -7942,7 +7944,7 @@ static void usage(FILE *fp) {
         "  ./ds4-server --ctx 100000 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192\n"
         "\n"
         "Notes:\n"
-        "  The server is Metal-only. Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
+        "  Use /v1/chat/completions, /v1/completions, or /v1/messages.\n"
         "  Larger --ctx values allocate more KV memory at startup; the startup log prints the estimate.\n"
         "  Disk KV caching is best for agents that resend long prompts with stable prefixes.\n"
         "\n"
@@ -7950,11 +7952,29 @@ static void usage(FILE *fp) {
         "      Show this help.\n");
 }
 
+static ds4_backend parse_backend_arg(const char *s, const char *arg) {
+    if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda");
+    exit(2);
+}
+
+static ds4_backend default_server_backend(void) {
+#ifdef DS4_NO_METAL
+    return DS4_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return DS4_BACKEND_METAL;
+#else
+    return DS4_BACKEND_CUDA;
+#endif
+}
+
 static server_config parse_options(int argc, char **argv) {
     server_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
-            .backend = DS4_BACKEND_METAL,
+            .backend = default_server_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -8024,8 +8044,14 @@ static server_config parse_options(int argc, char **argv) {
             directional_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
-        } else if (!strcmp(arg, "--cpu") || !strcmp(arg, "--backend")) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode is Metal-only");
+        } else if (!strcmp(arg, "--metal")) {
+            c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+        } else if (!strcmp(arg, "--backend")) {
+            c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--cpu")) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode requires a graph backend");
             exit(2);
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);

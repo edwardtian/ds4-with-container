@@ -88,11 +88,13 @@ static void usage(FILE *fp) {
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  --metal\n"
-        "      Use the Metal graph backend. This is the normal fast path and the default.\n"
+        "      Use the Metal graph backend. This is the normal fast path on macOS.\n"
+        "  --cuda\n"
+        "      Use the CUDA graph backend. This is the normal fast path on CUDA builds.\n"
         "  --cpu\n"
         "      Use the CPU reference/debug backend. Not recommended for normal inference.\n"
         "  --backend NAME\n"
-        "      Select backend explicitly: metal or cpu. Default: metal\n"
+        "      Select backend explicitly: metal, cuda, or cpu.\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
@@ -168,7 +170,7 @@ static void usage(FILE *fp) {
         "  ./ds4 --think-max --prompt-file prompt.txt --ctx 393216\n"
         "\n"
         "Notes:\n"
-        "  The CLI keeps KV cache state across interactive turns on the Metal backend.\n"
+        "  The CLI keeps KV cache state across interactive turns on graph backends.\n"
         "  Long added input is processed with batched prefill; short continuations use decode.\n"
         "  Startup prints the extra context-buffer memory for the selected context size.\n"
         "\n"
@@ -208,10 +210,21 @@ static float parse_float_range(const char *s, const char *opt, float min, float 
 
 static ds4_backend parse_backend(const char *s) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
+    if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     fprintf(stderr, "ds4: invalid backend: %s\n", s);
-    fprintf(stderr, "ds4: valid backends are: metal, cpu\n");
+    fprintf(stderr, "ds4: valid backends are: metal, cuda, cpu\n");
     exit(2);
+}
+
+static ds4_backend default_backend(void) {
+#ifdef DS4_NO_METAL
+    return DS4_BACKEND_CPU;
+#elif defined(__APPLE__)
+    return DS4_BACKEND_METAL;
+#else
+    return DS4_BACKEND_CUDA;
+#endif
 }
 
 static void log_context_memory(ds4_backend backend, int ctx_size) {
@@ -433,7 +446,7 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: sampled CLI generation requires the Metal session backend\n");
+        fprintf(stderr, "ds4: sampled CLI generation requires a graph session backend\n");
         return 1;
     }
 
@@ -606,7 +619,7 @@ static void json_write_token(FILE *fp, ds4_engine *engine, int token) {
 static int run_logprob_dump(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: --dump-logprobs requires the Metal session backend\n");
+        fprintf(stderr, "ds4: --dump-logprobs requires a graph session backend\n");
         return 1;
     }
 
@@ -839,7 +852,7 @@ static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool
 static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) {
-        fprintf(stderr, "ds4: interactive chat KV cache requires the Metal backend\n");
+        fprintf(stderr, "ds4: interactive chat KV cache requires a graph backend\n");
         return 1;
     }
     if (chat->session) ds4_session_free(chat->session);
@@ -1161,7 +1174,7 @@ static cli_config parse_options(int argc, char **argv) {
     cli_config c = {
         .engine = {
             .model_path = "ds4flash.gguf",
-            .backend = DS4_BACKEND_METAL,
+            .backend = default_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
         },
@@ -1234,6 +1247,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
+        } else if (!strcmp(arg, "--cuda")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
         } else if (!strcmp(arg, "--dump-tokens")) {
             c.gen.dump_tokens = true;
         } else if (!strcmp(arg, "--dump-logprobs")) {
