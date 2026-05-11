@@ -7893,8 +7893,8 @@ static void usage(FILE *fp) {
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before serving. Slower startup, fewer first-use stalls.\n"
-        "  --metal | --cuda | --backend NAME\n"
-        "      Select graph backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
+        "  --metal | --cuda | --cpu | --backend NAME\n"
+        "      Select backend explicitly. Defaults to Metal on macOS and CUDA on CUDA builds.\n"
         "\n"
         "HTTP API:\n"
         "  --host HOST\n"
@@ -7955,8 +7955,9 @@ static void usage(FILE *fp) {
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
+    if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda");
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
     exit(2);
 }
 
@@ -8051,8 +8052,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--backend")) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: server mode requires a graph backend");
-            exit(2);
+            c.engine.backend = DS4_BACKEND_CPU;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr);
@@ -8091,7 +8091,8 @@ int main(int argc, char **argv) {
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create Metal session");
+        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
+                   ds4_backend_name(cfg.engine.backend));
         ds4_engine_close(engine);
         return 1;
     }

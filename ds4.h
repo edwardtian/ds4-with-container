@@ -137,14 +137,14 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
     DS4_SESSION_REWRITE_OK = 0,
-    /* The live graph cannot be rewritten safely in place.  The caller should
+    /* The live backend state cannot be rewritten safely in place.  The caller should
      * restore an older checkpoint if it has one, then sync to the prompt. */
     DS4_SESSION_REWRITE_REBUILD_NEEDED = 1,
 } ds4_session_rewrite_result;
 
 /* Synchronize the live session to a full prompt token prefix.  If the current
- * checkpoint is a prefix, only the suffix is evaluated; otherwise the graph is
- * refilled from scratch. */
+ * checkpoint is a prefix, only the suffix is evaluated; otherwise the backend
+ * state is refilled from scratch. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(

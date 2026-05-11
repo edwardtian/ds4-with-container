@@ -70,7 +70,7 @@ static void usage(FILE *fp) {
         "\n"
         "Invocation modes:\n"
         "  ds4\n"
-        "      Start the interactive chat prompt: ds4>\n"
+        "      Start the interactive chat prompt with a session backend: ds4>\n"
         "  ds4 -p TEXT\n"
         "      Run one prompt and exit.\n"
         "  ds4 --prompt-file FILE\n"
@@ -170,7 +170,8 @@ static void usage(FILE *fp) {
         "  ./ds4 --think-max --prompt-file prompt.txt --ctx 393216\n"
         "\n"
         "Notes:\n"
-        "  The CLI keeps KV cache state across interactive turns on graph backends.\n"
+        "  The CLI keeps KV cache state across interactive turns on session backends.\n"
+        "  CPU mode supports interactive chat too, but it is a slow reference/debug path.\n"
         "  Long added input is processed with batched prefill; short continuations use decode.\n"
         "  Startup prints the extra context-buffer memory for the selected context size.\n"
         "\n"
@@ -446,7 +447,7 @@ static void build_prompt(ds4_engine *engine, const cli_generation_options *gen, 
 static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
-        fprintf(stderr, "ds4: sampled CLI generation requires a graph session backend\n");
+        fprintf(stderr, "ds4: sampled CLI generation requires a session backend\n");
         return 1;
     }
 
@@ -852,7 +853,7 @@ static void repl_chat_apply_max_prefix(ds4_engine *engine, repl_chat *chat, bool
 static int repl_chat_create_session(ds4_engine *engine, repl_chat *chat, int ctx_size) {
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, ctx_size) != 0) {
-        fprintf(stderr, "ds4: interactive chat KV cache requires a graph backend\n");
+        fprintf(stderr, "ds4: interactive chat KV cache requires a session backend\n");
         return 1;
     }
     if (chat->session) ds4_session_free(chat->session);
