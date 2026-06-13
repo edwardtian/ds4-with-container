@@ -89,6 +89,7 @@ typedef struct {
     uint32_t activation_bits;
     bool replay_check;
     bool debug;
+    bool use_shm_transport;
 } ds4_distributed_options;
 
 typedef struct {

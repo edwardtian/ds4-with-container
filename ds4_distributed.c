@@ -37,6 +37,93 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ds4_dist_transport.h"
+
+/* =========================================================================
+ * Shared-memory transport fd registry
+ * ========================================================================= */
+
+#define DS4_DIST_SHM_FD_BASE 1000000000
+#define DS4_DIST_MAX_SHM_CHANNELS 64
+
+static ds4_dist_channel *g_shm_channels[DS4_DIST_MAX_SHM_CHANNELS];
+static int g_shm_channel_count = 0;
+static pthread_mutex_t g_shm_channel_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_dist_use_shm = -1; /* -1 = not checked, 0 = disabled, 1 = enabled */
+
+static int dist_use_shm(void) {
+    if (g_dist_use_shm >= 0) return g_dist_use_shm;
+    g_dist_use_shm = getenv("DS4_DIST_USE_SHM") ? 1 : 0;
+    return g_dist_use_shm;
+}
+
+static int dist_shm_register(ds4_dist_channel *ch) {
+    pthread_mutex_lock(&g_shm_channel_mu);
+    if (g_shm_channel_count >= DS4_DIST_MAX_SHM_CHANNELS) {
+        pthread_mutex_unlock(&g_shm_channel_mu);
+        return -1;
+    }
+    int idx = g_shm_channel_count++;
+    g_shm_channels[idx] = ch;
+    pthread_mutex_unlock(&g_shm_channel_mu);
+    return DS4_DIST_SHM_FD_BASE + idx;
+}
+
+static ds4_dist_channel *dist_shm_lookup(int fd) {
+    if (fd < DS4_DIST_SHM_FD_BASE) return NULL;
+    int idx = fd - DS4_DIST_SHM_FD_BASE;
+    if (idx < 0 || idx >= DS4_DIST_MAX_SHM_CHANNELS) return NULL;
+    return g_shm_channels[idx];
+}
+
+static void dist_close_any(int fd) {
+    ds4_dist_channel *ch = dist_shm_lookup(fd);
+    if (ch) {
+        ds4_dist_ch_close(ch);
+        int idx = fd - DS4_DIST_SHM_FD_BASE;
+        pthread_mutex_lock(&g_shm_channel_mu);
+        if (idx >= 0 && idx < DS4_DIST_MAX_SHM_CHANNELS)
+            g_shm_channels[idx] = NULL;
+        pthread_mutex_unlock(&g_shm_channel_mu);
+        return;
+    }
+    if (fd >= 0) close(fd);
+}
+
+static int dist_write_full(int fd, const void *buf, size_t len) {
+    ds4_dist_channel *ch = dist_shm_lookup(fd);
+    if (ch) return ds4_dist_ch_write(ch, buf, len);
+    const unsigned char *p = (const unsigned char *)buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int dist_read_full(int fd, void *buf, size_t len) {
+    ds4_dist_channel *ch = dist_shm_lookup(fd);
+    if (ch) return ds4_dist_ch_read(ch, buf, len);
+    unsigned char *p = (unsigned char *)buf;
+    while (len > 0) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return 0;
+        p += (size_t)n;
+        len -= (size_t)n;
+    }
+    return 1;
+}
+
 /* =========================================================================
  * Protocol Constants And Wire Records
  * ========================================================================= */
@@ -1078,36 +1165,6 @@ static int dist_set_socket_low_latency(int fd) {
 #define DIST_DEBUG(...) ((void)0)
 #endif
 
-static int dist_write_full(int fd, const void *buf, size_t len) {
-    const unsigned char *p = buf;
-    while (len > 0) {
-        ssize_t n = send(fd, p, len, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return -1;
-        p += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static int dist_read_full(int fd, void *buf, size_t len) {
-    unsigned char *p = buf;
-    while (len > 0) {
-        ssize_t n = recv(fd, p, len, 0);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (n == 0) return 0;
-        p += (size_t)n;
-        len -= (size_t)n;
-    }
-    return 1;
-}
-
 static bool dist_connect_trace_enabled(void) {
     return getenv("DS4_DIST_CONNECT_TRACE") != NULL;
 }
@@ -1238,7 +1295,7 @@ static int dist_listener_port(int fd) {
     socklen_t slen = sizeof(ss);
     if (getsockname(fd, (struct sockaddr *)&ss, &slen) != 0) return 0;
     char service[NI_MAXSERV];
-    if (getnameinfo((struct sockaddr *)&ss, slen,
+    if (getnameinfo((const struct sockaddr *)&ss, slen,
                     NULL, 0,
                     service, sizeof(service),
                     NI_NUMERICSERV) != 0) {
@@ -1248,6 +1305,108 @@ static int dist_listener_port(int fd) {
     unsigned long v = strtoul(service, &end, 10);
     if (end == service || *end != '\0' || v > 65535ul) return 0;
     return (int)v;
+}
+
+/* ------------------------------------------------------------------
+ * SHM-aware wrappers for listener, connect, accept
+ * ------------------------------------------------------------------ */
+
+static int dist_open_listener_any(const char *host, int port,
+                                   char *err, size_t errlen) {
+    if (dist_use_shm() && ds4_dist_is_localhost(host)) {
+        /* Reserve a unique port number via a transient TCP socket. */
+        int tmp_fd = dist_open_listener_any("127.0.0.1", 0, err, errlen);
+        if (tmp_fd < 0) return -1;
+        int actual_port = dist_listener_port(tmp_fd);
+        dist_close_any(tmp_fd);
+        if (actual_port <= 0) {
+            if (errlen) snprintf(err, errlen, "unable to reserve port for shm");
+            return -1;
+        }
+        char shm_name[64];
+        snprintf(shm_name, sizeof(shm_name), "/ds4-dist-%d", actual_port);
+        ds4_dist_channel *ch = ds4_dist_shm_listen(shm_name);
+        if (!ch) {
+            if (errlen) snprintf(err, errlen, "shm listen failed: %s", strerror(errno));
+            return -1;
+        }
+        /* Store the port in the channel for later retrieval. */
+        /* (The SHM channel doesn't have a port field, but we don't need
+         *  it because the caller will use dist_listener_port_any.) */
+        int shm_fd = dist_shm_register(ch);
+        if (shm_fd < 0) {
+            ds4_dist_ch_close(ch);
+            if (errlen) snprintf(err, errlen, "shm fd register failed");
+            return -1;
+        }
+        return shm_fd;
+    }
+    return dist_open_listener(host, port, err, errlen);
+}
+
+static int dist_listener_port_any(int fd) {
+    if (fd >= DS4_DIST_SHM_FD_BASE) {
+        /* For SHM listeners, the port number is embedded in the SHM name.
+         * We parse it from the channel's name. */
+        ds4_dist_channel *ch = dist_shm_lookup(fd);
+        if (!ch) return 0;
+        /* The name format is "/ds4-dist-PORT" */
+        const char *name = ds4_dist_shm_channel_name(ch);
+        if (!name || !name[0]) return 0;
+        const char *p = strrchr(name, '-');
+        if (!p) return 0;
+        char *end = NULL;
+        long v = strtol(p + 1, &end, 10);
+        if (end == p + 1 || *end != '\0' || v <= 0 || v > 65535) return 0;
+        return (int)v;
+    }
+    return dist_listener_port(fd);
+}
+
+static int dist_accept_any(int listen_fd, struct sockaddr *addr, socklen_t *addrlen) {
+    if (listen_fd >= DS4_DIST_SHM_FD_BASE) {
+        ds4_dist_channel *listener = dist_shm_lookup(listen_fd);
+        if (!listener) { errno = EBADF; return -1; }
+        ds4_dist_channel *ch = ds4_dist_shm_accept(listener);
+        if (!ch) return -1;
+        /* Fill in a dummy localhost sockaddr so callers don't crash. */
+        if (addr && addrlen) {
+            struct sockaddr_in sin;
+            memset(&sin, 0, sizeof(sin));
+            sin.sin_family = AF_INET;
+            sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            sin.sin_port = 0;
+            size_t copy = *addrlen < sizeof(sin) ? *addrlen : sizeof(sin);
+            memcpy(addr, &sin, copy);
+            *addrlen = (socklen_t)copy;
+        }
+        return dist_shm_register(ch);
+    }
+    return accept(listen_fd, addr, addrlen);
+}
+
+static int dist_connect_endpoint(const char *host, int port, char *err, size_t errlen);
+
+static int dist_connect_endpoint_any(const char *host, int port,
+                                      char *err, size_t errlen) {
+    if (dist_use_shm() && ds4_dist_is_localhost(host)) {
+        char shm_name[64];
+        snprintf(shm_name, sizeof(shm_name), "/ds4-dist-%d", port);
+        ds4_dist_channel *ch = ds4_dist_shm_connect(shm_name);
+        if (!ch) {
+            if (errlen) snprintf(err, errlen, "shm connect to %s:%d failed: %s",
+                                 host, port, strerror(errno));
+            return -1;
+        }
+        int fd = dist_shm_register(ch);
+        if (fd < 0) {
+            ds4_dist_ch_close(ch);
+            if (errlen) snprintf(err, errlen, "shm fd register failed");
+            return -1;
+        }
+        return fd;
+    }
+    return dist_connect_endpoint(host, port, err, errlen);
 }
 
 static bool dist_connect_errno_retryable(int e) {
@@ -1427,7 +1586,7 @@ static int dist_connect_endpoint_once(const char *host, int port, int *last_errn
             fprintf(stderr, "ds4: distributed connect trace: connect to %s failed: %s\n",
                     dst_desc, strerror(saved_errno));
         }
-        close(fd);
+        dist_close_any(fd);
         fd = -1;
     }
 
@@ -2081,7 +2240,7 @@ static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
 static void dist_route_plan_free(ds4_dist_route_plan *plan) {
     if (!plan) return;
     for (uint32_t i = 0; i < plan->count; i++) {
-        if (plan->entry[i].fd >= 0) close(plan->entry[i].fd);
+        if (plan->entry[i].fd >= 0) dist_close_any(plan->entry[i].fd);
     }
     free(plan->entry);
     free(plan->blob);
@@ -2113,7 +2272,7 @@ static void dist_coordinator_forget_route_workers(
                 continue;
             }
             *link = entry->next;
-            close(entry->fd);
+            dist_close_any(entry->fd);
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: forgot failed route worker %s:%u layers=%u:%u%s\n",
                              plan->entry[i].host,
@@ -2286,7 +2445,7 @@ static bool dist_coordinator_build_route_plan(
             pthread_mutex_unlock(&state->mu);
             free(workers);
             free(path);
-            if (entry.fd >= 0) close(entry.fd);
+            if (entry.fd >= 0) dist_close_any(entry.fd);
             dist_route_plan_free(plan);
             if (errlen) snprintf(err, errlen, "out of memory building route entries");
             return false;
@@ -4159,7 +4318,7 @@ static void *dist_coordinator_client_main(void *arg) {
     int rc = dist_recv_hello(fd, &hello, model_name, sizeof(model_name), err, sizeof(err));
     if (rc <= 0) {
         if (rc < 0) DIST_COORD_DEBUG(state, "ds4: distributed coordinator: bad HELLO from %s:%s: %s\n", peer_host, peer_port, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
 
@@ -4167,7 +4326,7 @@ static void *dist_coordinator_client_main(void *arg) {
         snprintf(err, sizeof(err), "model id mismatch: worker=%u coordinator=%u", hello.model_id, state->model_id);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     const char *expected_model_name = ds4_engine_model_name(state->engine);
@@ -4180,42 +4339,42 @@ static void *dist_coordinator_client_main(void *arg) {
                  expected_model_name);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     if (hello.n_layers != state->n_layers) {
         snprintf(err, sizeof(err), "layer count mismatch: worker=%u coordinator=%u", hello.n_layers, state->n_layers);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     if (hello.quant_bits != 2u && hello.quant_bits != 4u) {
         snprintf(err, sizeof(err), "unsupported worker quant profile Q%u", hello.quant_bits);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     if (hello.has_output > 1u) {
         snprintf(err, sizeof(err), "invalid worker output-head flag %u", hello.has_output);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     if (hello.has_hidden > 1u) {
         snprintf(err, sizeof(err), "invalid worker hidden-state flag %u", hello.has_hidden);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     if (hello.layer_start >= hello.n_layers || hello.layer_end >= hello.n_layers || hello.layer_end < hello.layer_start) {
         snprintf(err, sizeof(err), "invalid worker layer range %u:%u for %u layers", hello.layer_start, hello.layer_end, hello.n_layers);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     if (hello.has_output && hello.layer_end + 1u != hello.n_layers) {
@@ -4227,7 +4386,7 @@ static void *dist_coordinator_client_main(void *arg) {
                  hello.n_layers);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     if (state->ctx_size != 0 && hello.ctx_size < state->ctx_size) {
@@ -4238,14 +4397,14 @@ static void *dist_coordinator_client_main(void *arg) {
                  state->ctx_size);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
     if (hello.listen_port == 0 || hello.listen_port > 65535u) {
         snprintf(err, sizeof(err), "invalid worker data listen port %u", hello.listen_port);
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: rejecting %s:%s: %s\n", peer_host, peer_port, err);
         dist_send_error(fd, err);
-        close(fd);
+        dist_close_any(fd);
         return NULL;
     }
 
@@ -4273,7 +4432,7 @@ static void *dist_coordinator_client_main(void *arg) {
     }
 
     dist_coordinator_remove_worker(state, fd);
-    close(fd);
+    dist_close_any(fd);
     return NULL;
 }
 
@@ -4285,7 +4444,7 @@ static void *dist_coordinator_accept_main(void *arg) {
     for (;;) {
         struct sockaddr_storage ss;
         socklen_t slen = sizeof(ss);
-        int fd = accept(listen_fd, (struct sockaddr *)&ss, &slen);
+        int fd = dist_accept_any(listen_fd, (struct sockaddr *)&ss, &slen);
         if (fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EBADF || errno == EINVAL) break;
@@ -4297,7 +4456,7 @@ static void *dist_coordinator_accept_main(void *arg) {
         ds4_dist_client_ctx *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
             DIST_COORD_DEBUG(state, "ds4: distributed coordinator: out of memory accepting worker\n");
-            close(fd);
+            dist_close_any(fd);
             continue;
         }
         ctx->state = state;
@@ -4313,7 +4472,7 @@ static void *dist_coordinator_accept_main(void *arg) {
         pthread_t tid;
         if (pthread_create(&tid, NULL, dist_coordinator_client_main, ctx) != 0) {
             DIST_COORD_DEBUG(state, "ds4: distributed coordinator: pthread_create failed\n");
-            close(fd);
+            dist_close_any(fd);
             free(ctx);
             continue;
         }
@@ -4922,7 +5081,7 @@ static int dist_save_remote_shard_to_file(
         size_t errlen) {
     if (payload_bytes_out) *payload_bytes_out = 0;
     uint64_t request_id = d->snapshot_request_id++;
-    int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
+    int fd = dist_connect_endpoint_any(entry->host, (int)entry->port, err, errlen);
     if (fd < 0) return 1;
 
     ds4_dist_snapshot_req_fixed req;
@@ -4978,7 +5137,7 @@ static int dist_save_remote_shard_to_file(
     rc = 0;
 
 cleanup:
-    close(fd);
+    dist_close_any(fd);
     return rc;
 }
 
@@ -5039,7 +5198,7 @@ static int dist_load_remote_shard_from_payload(
         char *err,
         size_t errlen) {
     uint64_t request_id = d->snapshot_request_id++;
-    int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
+    int fd = dist_connect_endpoint_any(entry->host, (int)entry->port, err, errlen);
     if (fd < 0) return 1;
 
     ds4_dist_snapshot_begin_fixed begin;
@@ -5068,7 +5227,7 @@ static int dist_load_remote_shard_from_payload(
     rc = 0;
 
 cleanup:
-    close(fd);
+    dist_close_any(fd);
     return rc;
 }
 
@@ -5406,12 +5565,12 @@ int ds4_dist_session_create(
     }
     if (dist_validate_options(opt, err, errlen) != 0) return 1;
 
-    int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, errlen);
+    int listen_fd = dist_open_listener_any(opt->listen_host, opt->listen_port, err, errlen);
     if (listen_fd < 0) return 1;
 
     ds4_dist_session *d = calloc(1, sizeof(*d));
     if (!d) {
-        close(listen_fd);
+        dist_close_any(listen_fd);
         if (errlen) snprintf(err, errlen, "out of memory creating distributed session");
         return 1;
     }
@@ -5455,7 +5614,7 @@ int ds4_dist_session_create(
     d->accept_ctx.state = &d->state;
     d->accept_ctx.listen_fd = listen_fd;
     if (pthread_create(&d->accept_tid, NULL, dist_coordinator_accept_main, &d->accept_ctx) != 0) {
-        close(listen_fd);
+        dist_close_any(listen_fd);
         pthread_mutex_destroy(&d->state.mu);
         free(d);
         if (errlen) snprintf(err, errlen, "failed to start distributed coordinator accept loop");
@@ -5470,8 +5629,8 @@ int ds4_dist_session_create(
 void ds4_dist_session_free(ds4_dist_session *d) {
     if (!d) return;
     if (d->listen_fd >= 0) {
-        shutdown(d->listen_fd, SHUT_RDWR);
-        close(d->listen_fd);
+        if (d->listen_fd < DS4_DIST_SHM_FD_BASE) shutdown(d->listen_fd, SHUT_RDWR);
+        dist_close_any(d->listen_fd);
         d->listen_fd = -1;
     }
     dist_route_plan_free(&d->plan);
@@ -5694,7 +5853,7 @@ int ds4_dist_session_eval(
 
 static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt, const ds4_dist_generation_options *gen) {
     char err[256];
-    int listen_fd = dist_open_listener(opt->listen_host, opt->listen_port, err, sizeof(err));
+    int listen_fd = dist_open_listener_any(opt->listen_host, opt->listen_port, err, sizeof(err));
     if (listen_fd < 0) {
         fprintf(stderr, "ds4: distributed coordinator: %s\n", err);
         return 1;
@@ -5743,7 +5902,7 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
     pthread_t accept_tid;
     if (pthread_create(&accept_tid, NULL, dist_coordinator_accept_main, &accept_ctx) != 0) {
         fprintf(stderr, "ds4: distributed coordinator: pthread_create failed for accept loop\n");
-        close(listen_fd);
+        dist_close_any(listen_fd);
         return 1;
     }
     pthread_detach(accept_tid);
@@ -6633,7 +6792,7 @@ static ds4_dist_worker_forwarder *dist_worker_get_forwarder(
         }
     }
 
-    int fd = dist_connect_endpoint(host, (int)port, err, errlen);
+    int fd = dist_connect_endpoint_any(host, (int)port, err, errlen);
     if (fd < 0) {
         pthread_mutex_unlock(&upstream->forward_mu);
         return NULL;
@@ -6641,7 +6800,7 @@ static ds4_dist_worker_forwarder *dist_worker_get_forwarder(
 
     ds4_dist_worker_forwarder *forwarder = calloc(1, sizeof(*forwarder));
     if (!forwarder) {
-        close(fd);
+        dist_close_any(fd);
         pthread_mutex_unlock(&upstream->forward_mu);
         if (errlen) snprintf(err, errlen, "out of memory creating worker-to-worker forwarder");
         return NULL;
@@ -6658,7 +6817,7 @@ static ds4_dist_worker_forwarder *dist_worker_get_forwarder(
         pthread_cond_destroy(&forwarder->queue_not_full);
         pthread_mutex_destroy(&forwarder->queue_mu);
         pthread_mutex_destroy(&forwarder->send_mu);
-        close(fd);
+        dist_close_any(fd);
         free(forwarder);
         pthread_mutex_unlock(&upstream->forward_mu);
         if (errlen) snprintf(err, errlen, "failed to start worker-to-worker relay thread");
@@ -6685,12 +6844,15 @@ static void dist_worker_upstream_destroy(ds4_dist_worker_upstream *upstream) {
 
     for (ds4_dist_worker_forwarder *it = forwarders; it; it = it->next) {
         dist_worker_forwarder_close_queue(it);
-        if (it->fd >= 0) shutdown(it->fd, SHUT_RDWR);
+        if (it->fd >= 0 && it->fd < DS4_DIST_SHM_FD_BASE) shutdown(it->fd, SHUT_RDWR);
     }
     while (forwarders) {
         ds4_dist_worker_forwarder *next = forwarders->next;
         if (forwarders->thread_started) pthread_join(forwarders->tid, NULL);
-        if (forwarders->fd >= 0) close(forwarders->fd);
+        if (forwarders->fd >= 0) {
+            if (forwarders->fd < DS4_DIST_SHM_FD_BASE) shutdown(forwarders->fd, SHUT_RDWR);
+            dist_close_any(forwarders->fd);
+        }
         dist_worker_forwarder_clear_requests(forwarders);
         pthread_cond_destroy(&forwarders->queue_not_full);
         pthread_mutex_destroy(&forwarders->queue_mu);
@@ -6854,7 +7016,7 @@ static int dist_temp_file(const char *prefix, char *path, size_t path_len, FILE 
     if (fd < 0) return -1;
     FILE *fp = fdopen(fd, "w+b");
     if (!fp) {
-        close(fd);
+        dist_close_any(fd);
         unlink(tmpl);
         return -1;
     }
@@ -7862,7 +8024,7 @@ static void *dist_worker_data_client_main(void *arg) {
                 peer_port);
     }
 
-    close(fd);
+    dist_close_any(fd);
     return NULL;
 }
 
@@ -7872,7 +8034,7 @@ static void *dist_worker_data_listener_main(void *arg) {
     for (;;) {
         struct sockaddr_storage ss;
         socklen_t slen = sizeof(ss);
-        int fd = accept(listen_fd, (struct sockaddr *)&ss, &slen);
+        int fd = dist_accept_any(listen_fd, (struct sockaddr *)&ss, &slen);
         if (fd < 0) {
             if (errno == EINTR) continue;
             fprintf(stderr, "ds4: distributed worker: data accept failed: %s\n", strerror(errno));
@@ -7883,7 +8045,7 @@ static void *dist_worker_data_listener_main(void *arg) {
         ds4_dist_data_client_ctx *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
             fprintf(stderr, "ds4: distributed worker: out of memory accepting data connection\n");
-            close(fd);
+            dist_close_any(fd);
             continue;
         }
         ctx->state = state;
@@ -7899,7 +8061,7 @@ static void *dist_worker_data_listener_main(void *arg) {
         pthread_t tid;
         if (pthread_create(&tid, NULL, dist_worker_data_client_main, ctx) != 0) {
             fprintf(stderr, "ds4: distributed worker: pthread_create failed for data connection\n");
-            close(fd);
+            dist_close_any(fd);
             free(ctx);
             continue;
         }
@@ -7920,15 +8082,15 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
     char err[256];
     const char *listen_host = opt->listen_host;
     int requested_port = opt->listen_port > 0 ? opt->listen_port : 0;
-    int listen_fd = dist_open_listener(listen_host, requested_port, err, sizeof(err));
+    int listen_fd = dist_open_listener_any(listen_host, requested_port, err, sizeof(err));
     if (listen_fd < 0) {
         fprintf(stderr, "ds4: distributed worker: %s\n", err);
         return 1;
     }
-    int listen_port_i = dist_listener_port(listen_fd);
+    int listen_port_i = dist_listener_port_any(listen_fd);
     if (listen_port_i <= 0) {
         fprintf(stderr, "ds4: distributed worker: could not determine data listener port\n");
-        close(listen_fd);
+        dist_close_any(listen_fd);
         return 1;
     }
     const uint32_t listen_port = (uint32_t)listen_port_i;
@@ -7947,7 +8109,7 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
     pthread_t data_tid;
     if (pthread_create(&data_tid, NULL, dist_worker_data_listener_main, &state) != 0) {
         fprintf(stderr, "ds4: distributed worker: pthread_create failed for data listener\n");
-        close(listen_fd);
+        dist_close_any(listen_fd);
         return 1;
     }
     pthread_detach(data_tid);
@@ -7963,7 +8125,7 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
             opt->coordinator_port);
 
     for (;;) {
-        int fd = dist_connect_endpoint(opt->coordinator_host, opt->coordinator_port, err, sizeof(err));
+        int fd = dist_connect_endpoint_any(opt->coordinator_host, opt->coordinator_port, err, sizeof(err));
         if (fd < 0) {
             fprintf(stderr, "ds4: distributed worker: %s; retrying\n", err);
             dist_sleep_reconnect();
@@ -7976,7 +8138,7 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
 
         if (dist_send_hello(engine, opt, ctx_size, listen_port, fd) != 0) {
             fprintf(stderr, "ds4: distributed worker: failed to send HELLO: %s\n", strerror(errno));
-            close(fd);
+            dist_close_any(fd);
             dist_sleep_reconnect();
             continue;
         }
@@ -7984,7 +8146,7 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
         int rc = getenv("DS4_DIST_DISABLE_WORKER_PREFETCH")
             ? dist_worker_read_loop(&state, fd)
             : dist_worker_read_loop_prefetch(&state, fd);
-        close(fd);
+        dist_close_any(fd);
         uint32_t dropped_sessions = dist_worker_clear_sessions(&state);
         if (dropped_sessions) {
             fprintf(stderr,
@@ -8138,6 +8300,9 @@ void ds4_dist_usage(FILE *fp) {
         "      Coordinator diagnostic: reset and replay the prompt, then compare logits.\n"
         "  --debug\n"
         "      Print coordinator route/debug logs. Workers keep their normal logs without this.\n"
+        "  --use-shm-transport\n"
+        "      Use POSIX shared memory for local data connections instead of TCP.\n"
+        "      Also respects DS4_DIST_USE_SHM environment variable.\n"
     );
 }
 
@@ -8274,6 +8439,14 @@ ds4_dist_cli_parse_result ds4_dist_parse_cli_arg(
         opt->debug = true;
         return DS4_DIST_CLI_MATCHED;
     }
+    if (!strcmp(arg, "--use-shm-transport")) {
+        if (!opt) {
+            if (errlen) snprintf(err, errlen, "missing distributed options");
+            return DS4_DIST_CLI_ERROR;
+        }
+        opt->use_shm_transport = true;
+        return DS4_DIST_CLI_MATCHED;
+    }
     return DS4_DIST_CLI_NOT_MATCHED;
 }
 
@@ -8348,6 +8521,7 @@ int ds4_dist_prepare_engine_options(
         ds4_engine_options *engine,
         char *err,
         size_t errlen) {
+    if (opt && opt->use_shm_transport) g_dist_use_shm = 1;
     if (dist_validate_options(opt, err, errlen) != 0) return 1;
     if (opt && opt->replay_check && opt->role != DS4_DISTRIBUTED_COORDINATOR) {
         if (errlen) snprintf(err, errlen, "--dist-replay-check requires --role coordinator");
