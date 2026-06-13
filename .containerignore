@@ -1,0 +1,19 @@
+# Ignore large runtime files that should be mounted as volumes
+*.gguf
+gguf/*.gguf
+
+# Ignore git and build artifacts
+.git/
+*.o
+ds4
+ds4-server
+ds4-bench
+ds4-eval
+ds4-agent
+
+# Ignore temp and IDE files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

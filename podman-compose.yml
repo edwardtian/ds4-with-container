@@ -1,0 +1,25 @@
+version: "3.8"
+services:
+  ds4-cuda:
+    image: ds4-cuda:latest
+    build:
+      context: .
+      dockerfile: Containerfile
+    container_name: ds4-cuda
+    devices:
+      - nvidia.com/gpu=all
+    volumes:
+      - ./gguf:/app/gguf:Z
+    environment:
+      - DS4_MODEL=/app/gguf/ds4flash.gguf
+    ports:
+      - "8000:8000"
+      - "9333:9333"
+    command:
+      - ./ds4-server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - -m
+      - /app/gguf/ds4flash.gguf
