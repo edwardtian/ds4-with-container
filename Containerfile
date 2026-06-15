@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y \
 
 # Copy and install CUDA toolkit from the local installer
 # The installer is run silently with toolkit only (no samples/docs)
-COPY cuda_13.3.0_610.43.02_linux.run /tmp/cuda_installer.run
+COPY /cuda-cache/cuda_13.3.0_610.43.02_linux.run /tmp/cuda_installer.run
 RUN chmod +x /tmp/cuda_installer.run && \
     /tmp/cuda_installer.run --silent --toolkit --installpath=/usr/local/cuda && \
     rm /tmp/cuda_installer.run
