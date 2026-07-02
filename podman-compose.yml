@@ -9,7 +9,7 @@ services:
     devices:
       - nvidia.com/gpu=all
     volumes:
-      - ./gguf:/app/gguf:Z
+      - ./gguf:/app/gguf:z
     environment:
       - DS4_MODEL=/app/gguf/ds4flash.gguf
     ports:

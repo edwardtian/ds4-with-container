@@ -1,26 +1,47 @@
 #!/bin/bash
 set -e
 
-# DS4 Distributed — Coordinator on GPU 1, Worker on GPU 0
+# DS4 Distributed Maximum Context Mode
+# Pushes the context window as far as practical on 2x96GB GPUs.
+# DeepSeek-V4-Flash supports up to 1M tokens. With compressed KV cache
+# (CSA/HCA), the memory scales sub-linearly, making very large contexts
+# feasible on this hardware.
 #
-# GPU 0 drives the display and has ~900 MB of desktop overhead.
-# GPU 1 is completely free. We run the memory-hungry coordinator
-# (API server + full context buffers + output head) on GPU 1,
-# and the worker on GPU 0.
+# Default: 786432 tokens (768K) — a safe maximum for 2x RTX PRO 6000.
+# Set CTX=1048576 for the absolute model limit (1M), but watch for OOM.
 #
-# This avoids the OOM crashes seen when the coordinator runs on
-# the display GPU with very large context windows.
+# Hardware: 2x NVIDIA RTX PRO 6000 Blackwell (96 GB each)
+# Model:     DeepSeek-V4-Flash q2-q4-imatrix
 
 CONTAINER_IMAGE="${CONTAINER_IMAGE:-ds4-cuda:latest}"
 MODEL_DIR="${MODEL_DIR:-$(pwd)/gguf}"
 DS4_MODEL="${DS4_MODEL:-/app/gguf/ds4flash.gguf}"
+CACHE_DIR="${CACHE_DIR:-/mnt/ds4_ramcache}"
+KV_DISK_SPACE_MB="${KV_DISK_SPACE_MB:-131072}"
 COORD_PORT="${COORD_PORT:-12345}"
 COORD_GPU="${COORD_GPU:-1}"
 WORKER_GPU="${WORKER_GPU:-0}"
 LAYERS_COORD="${LAYERS_COORD:-0:22}"
 LAYERS_WORKER="${LAYERS_WORKER:-23:42}"
-CTX="${CTX:-393216}"
+CTX="${CTX:-1048576}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-4096}"
+
+# Check and create RAM disk if needed
+if mount | grep -q " /mnt/ds4_ramcache "; then
+    MOUNT_SIZE=$(df --block-size=1G /mnt/ds4_ramcache | awk 'NR==2 {print $1}' | sed 's/G//')
+    if [ "${MOUNT_SIZE}" != "128" ]; then
+        echo "RAM disk size is ${MOUNT_SIZE}G, expected 128G; recreating..."
+        sudo umount /mnt/ds4_ramcache
+        sudo mount -t tmpfs -o size=128G tmpfs /mnt/ds4_ramcache
+    fi
+else
+    sudo mount -t tmpfs -o size=128G tmpfs /mnt/ds4_ramcache
+fi
+
+# Check and fix permissions if needed
+if [ "$(stat -c %U:%G /mnt/ds4_ramcache 2>/dev/null)" != "tianye:tianye" ]; then
+    sudo chown -R tianye:tianye /mnt/ds4_ramcache
+fi
 
 if [ "${USE_SHM:-0}" = "1" ]; then
     echo "Error: USE_SHM=1 is not supported by this C build; --use-shm-transport is not implemented."
@@ -28,12 +49,26 @@ if [ "${USE_SHM:-0}" = "1" ]; then
     exit 2
 fi
 
-echo "=== DS4 Distributed (Coordinator on GPU 1) ==="
+SERVER_CACHE_ARGS=()
+CACHE_MOUNT_ARGS=()
+if [ -n "${CACHE_DIR}" ]; then
+    mkdir -p "${CACHE_DIR}"
+    CACHE_MOUNT_ARGS=(-v "${CACHE_DIR}:/app/cache:z")
+    SERVER_CACHE_ARGS=(--kv-disk-dir /app/cache --kv-disk-space-mb "${KV_DISK_SPACE_MB}")
+fi
+
+echo "=== DS4 Maximum Context Mode ==="
 echo "  Image: ${CONTAINER_IMAGE}"
+echo "  Model dir: ${MODEL_DIR}"
+echo "  Coordinator GPU: ${COORD_GPU}"
+echo "  Worker GPU:      ${WORKER_GPU}"
 echo "  Context: ${CTX} tokens"
 echo "  Prefill chunk: ${PREFILL_CHUNK}"
-echo "  Coordinator: GPU ${COORD_GPU}, layers ${LAYERS_COORD}"
-echo "  Worker:      GPU ${WORKER_GPU}, layers ${LAYERS_WORKER}"
+echo "  Coordinator layers: ${LAYERS_COORD}"
+echo "  Worker layers:    ${LAYERS_WORKER}"
+if [ -n "${CACHE_DIR}" ]; then
+    echo "  KV cache: ${CACHE_DIR} (${KV_DISK_SPACE_MB} MiB budget)"
+fi
 echo ""
 
 if [ ! -d "${MODEL_DIR}" ]; then
@@ -59,10 +94,12 @@ podman run -d --rm \
     --device "nvidia.com/gpu=${COORD_GPU}" \
     -e "DS4_MODEL=${DS4_MODEL}" \
     -v "${MODEL_DIR}:/app/gguf:z" \
+    "${CACHE_MOUNT_ARGS[@]}" \
     "${CONTAINER_IMAGE}" \
     ./ds4-server \
         --host 0.0.0.0 \
         --port 8000 \
+        "${SERVER_CACHE_ARGS[@]}" \
         -m "${DS4_MODEL}" \
         --role coordinator \
         --layers "${LAYERS_COORD}" \
@@ -89,9 +126,14 @@ podman run -d --rm \
         --power 100
 
 echo ""
-echo "Distributed containers launched (coordinator on GPU 1)."
+echo "Maximum-context server is running."
 echo "  API server: http://localhost:8000"
 echo "  Context:    ${CTX} tokens"
+echo ""
+echo "Request Think Max from a client:"
+echo "  curl http://localhost:8000/v1/chat/completions \\"
+echo "    -H \"Content-Type: application/json\" \\"
+echo "    -d '{\"model\":\"deepseek-v4-flash\",\"messages\":[{\"role\":\"user\",\"content\":\"...\"}],\"reasoning_effort\":\"max\"}'"
 echo ""
 echo "Monitor logs:"
 echo "  podman logs -f ds4-coord"
@@ -99,3 +141,7 @@ echo "  podman logs -f ds4-worker"
 echo ""
 echo "Stop both:"
 echo "  podman stop ds4-coord ds4-worker"
+echo ""
+echo "Tips:"
+echo "  - If you hit OOM, lower CTX: CTX=524288 ./start-server.sh"
+echo "  - To try the model limit: CTX=1048576 ./start-server.sh"

@@ -23,10 +23,11 @@ This directory contains a complete [Podman](https://podman.io/) container setup 
 | `Containerfile` | Multi-step build: Ubuntu 24.04 + local CUDA 13.3 toolkit + compiled DS4 binaries |
 | `entrypoint.sh` | Auto-detects `.gguf` models in `/app/gguf/` and creates the `ds4flash.gguf` symlink |
 | `build_container.sh` | One-command build script |
-| `run_container.sh` | Run a single container (default: all GPUs, or pin with `GPU_ID=N`) |
+| `run_container.sh` | Run a single-process container (default: all GPUs visible, or pin with `GPU_ID=N`) |
 | `run_distributed.sh` | Launch coordinator + worker across two GPUs (coordinator on GPU 1) |
 | `run_think_max.sh` | Launch distributed Think Max mode (384K+ context) |
 | `run_max_ctx.sh` | Launch distributed maximum-context mode (768K+ context) |
+| `start-server.sh` | Local two-GPU server launcher with disk KV cache enabled |
 | `podman-compose.yml` | Alternative Podman Compose stack for single-GPU server mode |
 | `.containerignore` | Excludes large files (`*.gguf`, build artifacts) from the build context |
 
@@ -77,7 +78,7 @@ GPU_ID=1 ./run_container.sh
 
 ## Two-GPU Distributed Usage
 
-DS4's CUDA backend is single-GPU only. To use multiple GPUs, run DS4's **distributed inference**: split transformer layers across two processes that communicate over localhost TCP.
+DS4's CUDA backend is single-GPU only. To use both RTX PRO 6000 Blackwell GPUs, run DS4's **distributed inference**: split transformer layers across two processes that communicate over localhost TCP.
 
 **Important:** All distributed scripts run the **coordinator on GPU 1** and the **worker on GPU 0** by default. GPU 0 drives your display (~900 MB overhead), so the memory-hungry coordinator (API server + context buffers + output head) gets the clean GPU 1. This avoids the OOM crashes that occur when the coordinator runs on the display GPU.
 
@@ -89,8 +90,10 @@ This launches:
 
 | Role | Container | GPU | Layers | Exposed Port |
 |------|-----------|-----|--------|-------------|
-| Coordinator | `ds4-coord` | **1** | `0:30` + output head | `8000` |
-| Worker | `ds4-worker` | **0** | `31:output` | — |
+| Coordinator | `ds4-coord` | **1** | `0:22` + output head | `8000` |
+| Worker | `ds4-worker` | **0** | `23:42` | — |
+
+This topology keeps the output head on the cleaner GPU 1 and has the worker return the final hidden state instead of logits. The C distributed route planner supports this as `local 0:22 -> worker 23:42 -> local output` for the 43-layer Flash model.
 
 ### Monitor
 
@@ -108,7 +111,7 @@ podman stop ds4-coord ds4-worker
 ### Custom layer split
 
 ```bash
-LAYERS_COORD=0:25 LAYERS_WORKER=26:output ./run_distributed.sh
+LAYERS_COORD=0:25 LAYERS_WORKER=26:42 ./run_distributed.sh
 ```
 
 **Trade-offs:**
@@ -116,24 +119,9 @@ LAYERS_COORD=0:25 LAYERS_WORKER=26:output ./run_distributed.sh
 - **Prefill:** Faster (pipelined across GPUs)
 - **Generation:** ~15–20% slower than single-GPU due to per-token network hop
 
-### Shared-Memory Transport (optional)
+### Transport
 
-By default, the coordinator and worker exchange activation tensors over **localhost TCP**. You can switch to **POSIX shared memory** for same-machine multi-GPU setups to eliminate TCP stack overhead:
-
-```bash
-USE_SHM=1 ./run_distributed.sh
-```
-
-This works with all distributed scripts (`run_think_max.sh`, `run_max_ctx.sh`, `run_distributed_swap.sh`).
-
-**How it works:**
-- DS4 still uses TCP for the control path (HELLO, route setup, heartbeat).
-- Data connections (activation tensors) use a 256 MB ring buffer in `/dev/shm` with named semaphores for cross-process wake-up.
-- The shared-memory transport is **Linux-only** and silently falls back to TCP on other platforms.
-
-**When to use it:**
-- Always for same-host multi-GPU ( eliminates ~2× kernel copy + protocol overhead per tensor).
-- Not applicable for multi-node setups (TCP is used automatically when the peer is a remote IP).
+This branch uses localhost TCP for distributed activation transport. Older scripts referenced `--use-shm-transport`, but that option is not implemented in the C runtime here; the launchers now reject `USE_SHM=1` instead of passing an invalid flag.
 
 ---
 
@@ -191,12 +179,17 @@ The server defaults to high-effort thinking. Valid `reasoning_effort` values are
 |----------|---------|-------------|
 | `MODEL_DIR` | `$(pwd)/gguf` | Host path mounted into `/app/gguf` inside the container |
 | `DS4_MODEL` | `/app/gguf/ds4flash.gguf` | Path to the `.gguf` file inside the container |
-| `GPU_ID` | `all` | GPU index passed to `--device nvidia.com/gpu=`. Use `0`, `1`, or `all` |
-| `LAYERS_COORD` | `0:30` | Layer range for the distributed coordinator |
-| `LAYERS_WORKER` | `31:output` | Layer range for the distributed worker |
+| `CONTAINER_IMAGE` | `ds4-cuda:latest` | Podman image to launch |
+| `GPU_ID` | `all` (`run_container.sh`) | GPU index passed to `--device nvidia.com/gpu=`. Use `0`, `1`, or `all` |
+| `COORD_GPU` | `1` | Host GPU assigned to the coordinator |
+| `WORKER_GPU` | `0` | Host GPU assigned to the worker |
+| `LAYERS_COORD` | `0:22` | Layer range for the distributed coordinator |
+| `LAYERS_WORKER` | `23:42` | Layer range for the distributed worker |
 | `COORD_PORT` | `12345` | TCP port for coordinator/worker handshake |
 | `CTX` | `393216` (think-max) / `786432` (max-ctx) | Allocated context tokens |
-| `PREFILL_CHUNK` | `8192` | Prefill chunk size for long contexts |
+| `PREFILL_CHUNK` | `4096` | Prefill chunk size for long contexts |
+| `CACHE_DIR` | `/mnt/ds4_ramcache` (`start-server.sh`) | Host directory for server disk KV checkpoints |
+| `KV_DISK_SPACE_MB` | `8192` (`start-server.sh`) | Disk KV checkpoint budget |
 
 ---
 

@@ -53,7 +53,7 @@ if [ -n "${MODEL}" ] && [ -f "${MODEL}" ]; then
     echo "Model ready: /app/ds4flash.gguf -> ${MODEL}"
 else
     echo "Error: No .gguf model found in /app/gguf/. Mount your model directory with:"
-    echo "  podman run ... -v /path/to/models:/app/gguf:Z ..."
+    echo "  podman run ... -v /path/to/models:/app/gguf:z ..."
     exit 1
 fi
 
