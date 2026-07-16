@@ -26,6 +26,9 @@ LAYERS_WORKER="${LAYERS_WORKER:-23:42}"
 CTX="${CTX:-1048576}"
 PREFILL_CHUNK="${PREFILL_CHUNK:-4096}"
 
+# Stop any existing containers first
+podman stop ds4-coord ds4-worker 2>/dev/null || true
+
 # Check and create RAM disk if needed
 if mount | grep -q " /mnt/ds4_ramcache "; then
     MOUNT_SIZE=$(df --block-size=1G /mnt/ds4_ramcache | awk 'NR==2 {print $1}' | sed 's/G//')
@@ -82,9 +85,6 @@ if [ "${GPU_COUNT}" -lt 2 ]; then
     echo "Error: This script requires 2 GPUs, but only ${GPU_COUNT} found."
     exit 1
 fi
-
-# Stop any existing containers first
-podman stop ds4-coord ds4-worker 2>/dev/null || true
 
 echo "Launching coordinator on GPU ${COORD_GPU} (API + first layers + output head)..."
 podman run -d --rm \
