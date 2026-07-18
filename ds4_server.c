@@ -7713,6 +7713,7 @@ static void id_list_push_unique(stop_list *ids, const char *id);
 struct server {
     ds4_engine *engine;
     ds4_session *session;
+    bool engine_owned_by_session;
     int default_tokens;
     kv_disk_cache kv;
     tool_memory tool_mem;
@@ -11475,7 +11476,7 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
     ds4_session_free(s->session);
-    ds4_engine_close(s->engine);
+    if (!s->engine_owned_by_session) ds4_engine_close(s->engine);
     memset(s, 0, sizeof(*s));
 }
 
@@ -11652,6 +11653,8 @@ static server_config parse_options(int argc, char **argv) {
             directional_steering_scale_set = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--multi-gpu")) {
+            c.engine.multi_gpu = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
 #ifdef DS4_ROCM_BUILD
@@ -11710,31 +11713,43 @@ int main(int argc, char **argv) {
     }
 
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
-
-    log_context_memory(cfg.engine.backend,
-                       cfg.ctx_size,
-                       cfg.engine.prefill_chunk);
-    if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
-        ds4_dist_generation_options gen = {
-            .ctx_size = cfg.ctx_size,
-        };
-        int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
-        ds4_engine_close(engine);
-        return rc;
-    }
-
     ds4_session *session = NULL;
-    if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
-        server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
-                   ds4_backend_name(cfg.engine.backend));
-        ds4_engine_close(engine);
-        return 1;
+    bool engine_owned_by_session = false;
+
+    if (cfg.engine.multi_gpu) {
+        if (ds4_session_create_multi_gpu(&session, &cfg.engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create multi-GPU session");
+            return 1;
+        }
+        engine = ds4_session_engine(session);
+        engine_owned_by_session = true;
+    } else {
+        if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
+
+        log_context_memory(cfg.engine.backend,
+                           cfg.ctx_size,
+                           cfg.engine.prefill_chunk);
+        if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
+            ds4_dist_generation_options gen = {
+                .ctx_size = cfg.ctx_size,
+            };
+            int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
+            ds4_engine_close(engine);
+            return rc;
+        }
+
+        if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create %s session",
+                       ds4_backend_name(cfg.engine.backend));
+            ds4_engine_close(engine);
+            return 1;
+        }
     }
 
     server s;
     memset(&s, 0, sizeof(s));
     s.engine = engine;
+    s.engine_owned_by_session = engine_owned_by_session;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;

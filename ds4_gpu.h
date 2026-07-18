@@ -21,6 +21,10 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+int ds4_gpu_set_device(int dev);
+int ds4_gpu_count_devices(void);
+int ds4_gpu_get_device_count(void);
+int ds4_gpu_get_current_device(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);

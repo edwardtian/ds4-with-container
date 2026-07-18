@@ -21830,6 +21830,8 @@ struct ds4_engine {
     ds4_distributed_options distributed;
     bool metal_ready;
     bool mtp_ready;
+    bool owns_lock;
+    bool owns_gpu;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -23259,6 +23261,7 @@ static void ds4_acquire_instance_lock(void) {
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
+    struct ds4_multi_gpu *mgpu;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
 #endif
@@ -25575,7 +25578,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
-    ds4_acquire_instance_lock();
+    if (!opt->skip_lock) ds4_acquire_instance_lock();
+    e->owns_lock = !opt->skip_lock;
 
     if (opt->simulate_used_memory_bytes != 0 &&
         !ds4_ssd_memory_lock_acquire(&e->simulated_memory,
@@ -25713,7 +25717,9 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
     }
     if (graph_backend) {
+      if (!opt->skip_gpu_init) {
         e->metal_ready = ds4_gpu_init() != 0;
+        e->owns_gpu = true;
         if (!e->metal_ready) {
             fprintf(stderr, "ds4: %s backend unavailable; aborting startup\n",
                     ds4_backend_name(e->backend));
@@ -25762,6 +25768,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 }
             }
         }
+      } else {
+        /* GPU already initialized by the first sub-engine */
+        e->metal_ready = true;
+      }
         (void)ds4_gpu_set_model_fd(e->model.fd);
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
@@ -26027,13 +26037,300 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
-    ds4_gpu_cleanup();
+    if (e->owns_gpu) ds4_gpu_cleanup();
 #endif
-    ds4_ssd_memory_lock_release(&e->simulated_memory);
-    ds4_release_instance_lock();
+    if (e->owns_lock) ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
+}
+
+/* =========================================================================
+ * Multi-GPU pipeline-parallel session.
+ * =========================================================================
+ *
+ * When --multi-gpu is enabled, the session creates one sub-engine per GPU,
+ * each loading a contiguous slice of transformer layers.  During decode and
+ * prefill, activations flow through the GPUs in order: GPU 0 processes its
+ * layers, the hidden state is copied (host bounce) to GPU 1, which processes
+ * its layers, and so on.  The last GPU also runs the output head and produces
+ * logits.
+ *
+ * The "primary" session (returned to the caller) is the last GPU's session.
+ * It owns the logits buffer and the user-visible checkpoint.  The other
+ * sub-sessions are managed internally and freed when the primary is freed.
+ */
+
+#define DS4_MAX_MGPU 8
+
+struct ds4_multi_gpu {
+    int n_gpus;
+    ds4_engine *engines[DS4_MAX_MGPU];
+    ds4_session *sessions[DS4_MAX_MGPU];
+    uint32_t layer_start[DS4_MAX_MGPU];
+    uint32_t layer_end[DS4_MAX_MGPU];   /* inclusive */
+    bool last_has_output[DS4_MAX_MGPU];
+    float *hc_buf;                       /* host activation transfer buffer */
+    uint64_t hc_buf_cap;                 /* bytes */
+};
+
+#ifndef DS4_NO_GPU
+/* ---- Full multi-GPU implementation (CUDA/Metal available) ---- */
+
+static void ds4_mgpu_free(struct ds4_multi_gpu *mg) {
+    if (!mg) return;
+    free(mg->hc_buf);
+    /* Close in reverse order: engine 0 owns the GPU and lock, so it must
+     * be closed last (after all other engines have released their resources). */
+    for (int i = mg->n_gpus - 1; i >= 0; i--) {
+        ds4_session_free(mg->sessions[i]);
+        ds4_engine_close(mg->engines[i]);
+    }
+    free(mg);
+}
+
+static struct ds4_multi_gpu *ds4_mgpu_create(
+        const ds4_engine_options *opt,
+        int ctx_size,
+        char *err,
+        size_t errlen) {
+#ifndef DS4_NO_GPU
+    int n_gpus = ds4_gpu_count_devices();
+    if (n_gpus < 2) {
+        if (errlen) snprintf(err, errlen,
+                             "--multi-gpu requires 2+ GPUs, found %d", n_gpus);
+        return NULL;
+    }
+    if (n_gpus > DS4_MAX_MGPU) n_gpus = DS4_MAX_MGPU;
+
+    struct ds4_multi_gpu *mg = xcalloc(1, sizeof(*mg));
+    mg->n_gpus = n_gpus;
+
+    /* We need the layer count to compute splits.  Open the model in
+     * inspect-only mode (no GPU weight loading) to read metadata. */
+    ds4_engine *probe = NULL;
+    ds4_engine_options probe_opt = *opt;
+    probe_opt.inspect_only = true;
+    probe_opt.multi_gpu = false;
+    probe_opt.skip_lock = true;
+    probe_opt.skip_gpu_init = true;
+    if (ds4_engine_open(&probe, &probe_opt) != 0 || !probe) {
+        if (errlen) snprintf(err, errlen, "multi-GPU: failed to open model for shape probe");
+        free(mg);
+        return NULL;
+    }
+    const uint32_t n_layer = (uint32_t)ds4_engine_layer_count(probe);
+    ds4_engine_close(probe);
+
+    if (n_layer < (uint32_t)n_gpus) {
+        if (errlen) snprintf(err, errlen,
+                             "multi-GPU: model has %u layers, need >= %d GPUs",
+                             n_layer, n_gpus);
+        free(mg);
+        return NULL;
+    }
+
+    /* Compute even layer splits */
+    for (int i = 0; i < n_gpus; i++) {
+        mg->layer_start[i] = (uint32_t)((uint64_t)i * n_layer / n_gpus);
+        mg->layer_end[i] = (uint32_t)((uint64_t)(i + 1) * n_layer / n_gpus) - 1u;
+        mg->last_has_output[i] = (i == n_gpus - 1);
+    }
+
+    /* Create one engine+session per GPU.
+     * The first sub-engine acquires the instance lock and initializes CUDA.
+     * All others skip both to avoid conflicts. */
+    for (int i = 0; i < n_gpus; i++) {
+        ds4_gpu_set_device(i);
+
+        ds4_engine_options slice_opt = *opt;
+        slice_opt.multi_gpu = false;       /* don't recurse */
+        slice_opt.load_slice = true;
+        slice_opt.load_layer_start = mg->layer_start[i];
+        slice_opt.load_layer_end = mg->last_has_output[i] ? UINT32_MAX : mg->layer_end[i];
+        slice_opt.load_output = mg->last_has_output[i];
+        slice_opt.distributed.role = DS4_DISTRIBUTED_NONE;
+        slice_opt.distributed.layers.set = false;
+        slice_opt.skip_lock = (i > 0);         /* only first engine locks */
+        slice_opt.skip_gpu_init = (i > 0);     /* only first engine inits GPU */
+
+        if (ds4_engine_open(&mg->engines[i], &slice_opt) != 0) {
+            if (errlen) snprintf(err, errlen,
+                                 "multi-GPU: failed to open engine for GPU %d (layers %u:%u)",
+                                 i, mg->layer_start[i], mg->layer_end[i]);
+            ds4_mgpu_free(mg);
+            return NULL;
+        }
+
+        if (ds4_session_create(&mg->sessions[i], mg->engines[i], ctx_size) != 0) {
+            if (errlen) snprintf(err, errlen,
+                                 "multi-GPU: failed to create session for GPU %d", i);
+            ds4_engine_close(mg->engines[i]);
+            mg->engines[i] = NULL;
+            ds4_mgpu_free(mg);
+            return NULL;
+        }
+    }
+
+    /* Allocate host activation buffer (single token = DS4_N_HC * DS4_N_EMBD floats) */
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    mg->hc_buf_cap = hc_dim * sizeof(float);
+    mg->hc_buf = xmalloc(mg->hc_buf_cap);
+    if (!mg->hc_buf) {
+        if (errlen) snprintf(err, errlen, "multi-GPU: out of memory for activation buffer");
+        ds4_mgpu_free(mg);
+        return NULL;
+    }
+
+    fprintf(stderr, "ds4: multi-GPU: %d GPUs, layers:", n_gpus);
+    for (int i = 0; i < n_gpus; i++) {
+        fprintf(stderr, " GPU%d=%u:%u%s", i, mg->layer_start[i], mg->layer_end[i],
+                mg->last_has_output[i] ? "+out" : "");
+    }
+    fprintf(stderr, "\n");
+
+    ds4_gpu_set_device(0);
+    return mg;
+#else
+    (void)opt; (void)ctx_size;
+    if (errlen) snprintf(err, errlen, "multi-GPU requires CUDA support");
+    return NULL;
+#endif
+}
+
+static int ds4_mgpu_eval(struct ds4_multi_gpu *mg,
+                         int token, uint32_t pos,
+                         float *logits,
+                         char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    const int tok[1] = {token};
+    const uint32_t n_tok = 1;
+    float *input_hc = NULL;   /* GPU 0 uses token embedding, not input_hc */
+
+    for (int i = 0; i < mg->n_gpus; i++) {
+        ds4_gpu_set_device(i);
+
+        bool is_last = (i == mg->n_gpus - 1);
+        float *out_hc = is_last ? NULL : mg->hc_buf;
+        float *out_logits = is_last ? logits : NULL;
+
+        if (ds4_session_eval_layer_slice(mg->sessions[i],
+                                         tok, n_tok, pos,
+                                         mg->layer_start[i], mg->layer_end[i],
+                                         input_hc, out_hc,
+                                         is_last, out_logits,
+                                         err, errlen) != 0) {
+            ds4_gpu_set_device(0);
+            return 1;
+        }
+        input_hc = mg->hc_buf;   /* feed output to next GPU */
+    }
+
+    ds4_gpu_set_device(0);
+    return 0;
+#else
+    (void)mg; (void)token; (void)pos; (void)logits;
+    if (errlen) snprintf(err, errlen, "multi-GPU requires CUDA support");
+    return 1;
+#endif
+}
+
+static int ds4_mgpu_sync_chunk(struct ds4_multi_gpu *mg,
+                               const int *tokens, uint32_t n_tokens, uint32_t pos0,
+                               float *logits,
+                               char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    /* Ensure the activation buffer is large enough for a batch */
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t needed = (uint64_t)n_tokens * hc_dim * sizeof(float);
+    if (needed > mg->hc_buf_cap) {
+        float *nb = realloc(mg->hc_buf, needed);
+        if (!nb) {
+            if (errlen) snprintf(err, errlen, "multi-GPU: out of memory for activation buffer (%llu bytes)",
+                                 (unsigned long long)needed);
+            return 1;
+        }
+        mg->hc_buf = nb;
+        mg->hc_buf_cap = needed;
+    }
+
+    const float *input_hc = NULL;
+
+    for (int i = 0; i < mg->n_gpus; i++) {
+        ds4_gpu_set_device(i);
+
+        bool is_last = (i == mg->n_gpus - 1);
+        float *out_hc = is_last ? NULL : mg->hc_buf;
+        float *out_logits = is_last ? logits : NULL;
+
+        if (ds4_session_eval_layer_slice(mg->sessions[i],
+                                         tokens, n_tokens, pos0,
+                                         mg->layer_start[i], mg->layer_end[i],
+                                         input_hc, out_hc,
+                                         is_last, out_logits,
+                                         err, errlen) != 0) {
+            ds4_gpu_set_device(0);
+            return 1;
+        }
+        input_hc = mg->hc_buf;
+    }
+
+    ds4_gpu_set_device(0);
+    return 0;
+#else
+    (void)mg; (void)tokens; (void)n_tokens; (void)pos0; (void)logits;
+    if (errlen) snprintf(err, errlen, "multi-GPU requires CUDA support");
+    return 1;
+#endif
+}
+
+#endif /* DS4_NO_GPU */
+
+/* ---- Stubs for CPU-only builds ---- */
+#ifndef DS4_NO_GPU
+/* (real implementations above) */
+#else
+static void ds4_mgpu_free(struct ds4_multi_gpu *mg) {
+    (void)mg;
+}
+static struct ds4_multi_gpu *ds4_mgpu_create(const ds4_engine_options *opt,
+                                              int ctx_size, char *err, size_t errlen) {
+    (void)opt; (void)ctx_size;
+    if (errlen) snprintf(err, errlen, "multi-GPU requires CUDA support");
+    return NULL;
+}
+static int ds4_mgpu_eval(struct ds4_multi_gpu *mg, int token, uint32_t pos,
+                          float *logits, char *err, size_t errlen) {
+    (void)mg; (void)token; (void)pos; (void)logits;
+    if (errlen) snprintf(err, errlen, "multi-GPU requires CUDA support");
+    return 1;
+}
+static int ds4_mgpu_sync_chunk(struct ds4_multi_gpu *mg,
+                                const int *tokens, uint32_t n_tokens, uint32_t pos0,
+                                float *logits, char *err, size_t errlen) {
+    (void)mg; (void)tokens; (void)n_tokens; (void)pos0; (void)logits;
+    if (errlen) snprintf(err, errlen, "multi-GPU requires CUDA support");
+    return 1;
+}
+#endif
+
+int ds4_session_create_multi_gpu(ds4_session **out, const ds4_engine_options *opt, int ctx_size) {
+    if (!out || !opt || ctx_size <= 0) return 1;
+    char err[256];
+    struct ds4_multi_gpu *mg = ds4_mgpu_create(opt, ctx_size, err, sizeof(err));
+    if (!mg) {
+        fprintf(stderr, "ds4: multi-GPU session creation failed: %s\n", err);
+        return 1;
+    }
+    /* The primary session is the last GPU's session (has the output head). */
+    ds4_session *s = mg->sessions[mg->n_gpus - 1];
+    s->mgpu = mg;
+    *out = s;
+    return 0;
+}
+
+ds4_engine *ds4_session_engine(ds4_session *s) {
+    return s ? s->engine : NULL;
 }
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
@@ -26121,6 +26418,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    if (s->mgpu) {
+        struct ds4_multi_gpu *mg = s->mgpu;
+        s->mgpu = NULL;  /* prevent recursive free */
+        ds4_mgpu_free(mg);
+        return;  /* s was freed as part of mg->sessions */
+    }
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
@@ -26714,6 +27017,63 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                      err,
                                      errlen);
     }
+    if (s->mgpu) {
+        /* Multi-GPU prefill: process the prompt in chunks through the GPU
+         * pipeline.
+         *
+         * If the checkpoint is a valid prefix of the prompt, only the suffix
+         * needs to be processed.  Otherwise, reset and process from scratch.
+         *
+         * ds4_session_eval_layer_slice (called inside ds4_mgpu_sync_chunk)
+         * already pushes tokens into each sub-session's checkpoint, including
+         * the primary session (s == mg->sessions[n_gpus-1]).  We must NOT
+         * push tokens again here — that would double the checkpoint length
+         * and break the next chunk's timeline check. */
+        uint32_t pos = 0;
+        if (s->checkpoint_valid &&
+            (uint32_t)prompt->len >= (uint32_t)s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint))
+        {
+            /* Extend: skip the already-cached prefix */
+            pos = (uint32_t)s->checkpoint.len;
+        } else {
+            /* Cold start: reset all sub-sessions */
+#ifndef DS4_NO_GPU
+            for (int i = 0; i < s->mgpu->n_gpus; i++) {
+                ds4_gpu_set_device(i);
+                ds4_session_layer_slice_reset(s->mgpu->sessions[i], err, errlen);
+            }
+            ds4_gpu_set_device(0);
+#endif
+        }
+
+        const uint32_t chunk = s->prefill_cap;
+        while (pos < (uint32_t)prompt->len) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            uint32_t n = (uint32_t)prompt->len - pos;
+            if (n > chunk) n = chunk;
+
+            if (ds4_mgpu_sync_chunk(s->mgpu, prompt->v + pos, n, pos,
+                                    s->logits, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            if (s->progress)
+                s->progress(s->progress_ud, "prefill_chunk",
+                            pos + n, prompt->len);
+            pos += n;
+        }
+
+        /* checkpoint_valid is already set by ds4_session_eval_layer_slice */
+#ifndef DS4_NO_GPU
+        ds4_gpu_set_device(0);
+#endif
+        return 0;
+    }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&
@@ -27065,6 +27425,20 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (s->mgpu) {
+        if (!s->checkpoint_valid) {
+            if (errlen) snprintf(err, errlen, "multi-GPU decode requires a valid checkpoint");
+            return 1;
+        }
+        (void)probe_mtp;
+        if (ds4_mgpu_eval(s->mgpu, token, (uint32_t)s->checkpoint.len,
+                          s->logits, err, errlen) != 0) {
+            s->checkpoint_valid = false;
+            return 1;
+        }
+        /* checkpoint already updated by ds4_session_eval_layer_slice */
+        return 0;
+    }
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
