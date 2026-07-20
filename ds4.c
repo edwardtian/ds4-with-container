@@ -1334,6 +1334,12 @@ static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
 static uint32_t g_requested_threads;
 
+/* Tensor-parallel expert sharding (set by ds4_engine_open when TP is active) */
+static uint32_t g_tp_expert_start = 0;
+static uint32_t g_tp_expert_count = 0;  /* 0 = all experts (no sharding) */
+static int g_tp_peer_device = -1;        /* peer GPU for all-reduce, -1 = no TP */
+static bool g_tp_skip_post_moe = false;  /* TP: skip post-MoE in decode/batch layer */
+
 static void *ds4_worker_main(void *arg) {
     const uint32_t tid = (uint32_t)(uintptr_t)arg;
     uint32_t seen_generation = 0;
@@ -2204,6 +2210,7 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             accelerator_name,
             tty ? ": 0.00 GiB" : "\n");
     fflush(stderr);
+    if (getenv("DS4_TP_DEBUG")) ds4_gpu_print_memory_report("before cache");
 
     for (uint64_t i = 0; i < nspan;) {
         uint64_t off = spans[i].off;
@@ -14839,6 +14846,89 @@ static bool metal_graph_profile_router_selection(
     return true;
 }
 
+/* TP post-MoE: run only the shared-down + HC-expand step.  Called after
+ * the all-reduce of routed_out to produce the correct after_ffn_hc. */
+static bool metal_graph_tp_decode_post_moe(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t pos) {
+    const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
+    const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
+    const bool fuse_shared_down_hc =
+        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+    bool ok = true;
+    if (ok && fuse_shared_down_hc) {
+        ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(g->after_ffn_hc,
+                                                         g->shared_out, model->map, model->size,
+                                                         layer->ffn_down_shexp->abs_offset,
+                                                         shared_dim, DS4_N_EMBD,
+                                                         g->shared_mid, g->routed_out,
+                                                         g->after_attn_hc, g->hc_split,
+                                                         DS4_N_EMBD, DS4_N_HC) != 0;
+    } else if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->shared_out, model->map, model->size,
+                                          layer->ffn_down_shexp->abs_offset,
+                                          shared_dim, DS4_N_EMBD, g->shared_mid, 1) != 0;
+    }
+    if (ok && keep_ffn_out) {
+        ok = metal_graph_ensure_ffn_out(g) &&
+             ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc, g->ffn_out,
+                                        g->after_attn_hc, g->hc_post, g->hc_comb,
+                                        DS4_N_EMBD, DS4_N_HC) != 0;
+    } else if (ok && !fuse_shared_down_hc) {
+        ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
+                                                  g->routed_out, g->shared_out,
+                                                  g->after_attn_hc, g->hc_split,
+                                                  DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    return ok;
+}
+
+/* TP post-MoE for batch (prefill) path.  Same logic but for batch tensors. */
+static bool metal_graph_tp_batch_post_moe(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t il,
+        uint32_t pos0,
+        uint32_t n_tokens) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
+    /* Batch path: do shared down + HC expand separately (NOT fused, which
+     * is decode-only).  Match the original metal_graph_encode_layer_ffn_batch
+     * post-MoE logic. */
+    ds4_gpu_tensor *next_hc_view = ds4_gpu_tensor_view(
+            g->batch_next_hc, 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
+    ds4_gpu_tensor *hc_split_view = ds4_gpu_tensor_view(
+            g->batch_hc_split, 0, (uint64_t)n_tokens * 24 * sizeof(float));
+    bool ok = next_hc_view && hc_split_view;
+    /* Shared down-projection (batch matmul) */
+    if (ok) {
+        ok = ds4_gpu_matmul_q8_0_tensor(g->batch_shared_out, model->map, model->size,
+                                          layer->ffn_down_shexp->abs_offset,
+                                          shared_dim, DS4_N_EMBD,
+                                          g->batch_shared_mid, n_tokens) != 0;
+    }
+    /* HC expand (batch) */
+    if (ok) {
+        ok = ds4_gpu_hc_expand_add_split_tensor(next_hc_view,
+                                                  g->batch_routed_out, g->batch_shared_out,
+                                                  g->batch_after_attn_hc, hc_split_view,
+                                                  DS4_N_EMBD, DS4_N_HC) != 0;
+    }
+    ds4_gpu_tensor_free(next_hc_view);
+    ds4_gpu_tensor_free(hc_split_view);
+    return ok;
+}
+
 static bool metal_graph_encode_decode_layer(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
@@ -15709,6 +15799,7 @@ static bool metal_graph_encode_decode_layer(
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+        if (g_tp_skip_post_moe) return ok;
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                           (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -15882,6 +15973,7 @@ static bool metal_graph_encode_decode_layer(
                                                      DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                      il) != 0;
         DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+        if (g_tp_skip_post_moe) return ok;
         if (ok) {
             metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                           (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -15966,6 +16058,7 @@ static bool metal_graph_encode_decode_layer(
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                  il) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+    if (g_tp_skip_post_moe) return ok;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -19198,6 +19291,13 @@ static bool metal_graph_encode_layer_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
+    if (g_tp_skip_post_moe) {
+        ds4_gpu_tensor_free(next_hc_view);
+        ds4_gpu_tensor_free(ffn_cur_view);
+        ds4_gpu_tensor_free(hc_split_view);
+        ds4_gpu_tensor_free(hc_mix_view);
+        return ok;
+    }
     if (!shared_done) {
         DS4_METAL_ENCODE_PREFILL_SHARED_EXPERT();
     }
@@ -19275,7 +19375,7 @@ static bool metal_graph_encode_layer_batch(
             fprintf(stderr, "ds4: gpu layer %u ffn batch encode failed\n", il);
         }
     }
-    if (ok) {
+    if (ok && !g_tp_skip_post_moe) {
         ds4_gpu_tensor *tmp = g->batch_cur_hc;
         g->batch_cur_hc = g->batch_next_hc;
         g->batch_next_hc = tmp;
@@ -21832,6 +21932,8 @@ struct ds4_engine {
     bool mtp_ready;
     bool owns_lock;
     bool owns_gpu;
+    uint32_t tp_expert_start;
+    uint32_t tp_expert_count;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -23262,6 +23364,7 @@ struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
     struct ds4_multi_gpu *mgpu;
+    struct ds4_tensor_parallel *tp;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
 #endif
@@ -25560,6 +25663,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
+    e->tp_expert_start = opt->tp_expert_start;
+    e->tp_expert_count = opt->tp_expert_count;
+    g_tp_expert_start = opt->tp_expert_start;
+    g_tp_expert_count = opt->tp_expert_count;
     if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
@@ -25639,6 +25746,35 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_layer_end,
                  load_output,
                  load_output_optional);
+    /* Tensor-parallel: adjust expert tensor descriptors to only cover the
+     * local expert subset, so model map span caching and MoE kernel both
+     * use the correct local offset and count. */
+    if (e->tp_expert_count > 0) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            ds4_layer_weights *lw = &e->weights.layer[il];
+            if (lw->ffn_gate_exps && lw->ffn_gate_exps->ndim >= 3) {
+                uint32_t n_exp = (uint32_t)lw->ffn_gate_exps->dim[lw->ffn_gate_exps->ndim - 1];
+                uint64_t per_exp = lw->ffn_gate_exps->bytes / n_exp;
+                lw->ffn_gate_exps->abs_offset += (uint64_t)e->tp_expert_start * per_exp;
+                lw->ffn_gate_exps->bytes = (uint64_t)e->tp_expert_count * per_exp;
+                lw->ffn_gate_exps->dim[lw->ffn_gate_exps->ndim - 1] = e->tp_expert_count;
+            }
+            if (lw->ffn_up_exps && lw->ffn_up_exps->ndim >= 3) {
+                uint32_t n_exp = (uint32_t)lw->ffn_up_exps->dim[lw->ffn_up_exps->ndim - 1];
+                uint64_t per_exp = lw->ffn_up_exps->bytes / n_exp;
+                lw->ffn_up_exps->abs_offset += (uint64_t)e->tp_expert_start * per_exp;
+                lw->ffn_up_exps->bytes = (uint64_t)e->tp_expert_count * per_exp;
+                lw->ffn_up_exps->dim[lw->ffn_up_exps->ndim - 1] = e->tp_expert_count;
+            }
+            if (lw->ffn_down_exps && lw->ffn_down_exps->ndim >= 3) {
+                uint32_t n_exp = (uint32_t)lw->ffn_down_exps->dim[lw->ffn_down_exps->ndim - 1];
+                uint64_t per_exp = lw->ffn_down_exps->bytes / n_exp;
+                lw->ffn_down_exps->abs_offset += (uint64_t)e->tp_expert_start * per_exp;
+                lw->ffn_down_exps->bytes = (uint64_t)e->tp_expert_count * per_exp;
+                lw->ffn_down_exps->dim[lw->ffn_down_exps->ndim - 1] = e->tp_expert_count;
+            }
+        }
+    }
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
         const uint64_t safe_cache_bytes =
@@ -25729,6 +25865,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+        ds4_gpu_set_tensor_parallel_experts(e->tp_expert_start, e->tp_expert_count);
         if (!ds4_engine_configure_streaming_auto_cache(e)) {
             ds4_engine_close(e);
             *out = NULL;
@@ -25969,6 +26106,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
+    } else if (graph_backend && opt->skip_gpu_init) {
+        e->metal_ready = true;  /* GPU already initialized by first sub-engine */
     }
 #else
     if (graph_backend) {
@@ -26333,6 +26472,236 @@ ds4_engine *ds4_session_engine(ds4_session *s) {
     return s ? s->engine : NULL;
 }
 
+/* =========================================================================
+ * Tensor-parallel session (expert-parallel MoE).
+ * ========================================================================= */
+
+struct ds4_tensor_parallel {
+    int n_gpus;
+    ds4_engine *engines[DS4_MAX_MGPU];
+    ds4_session *sessions[DS4_MAX_MGPU];
+    uint32_t expert_start[DS4_MAX_MGPU];
+    uint32_t expert_count[DS4_MAX_MGPU];
+};
+
+static void ds4_tp_free(struct ds4_tensor_parallel *tp) {
+    if (!tp) return;
+#ifndef DS4_NO_GPU
+    ds4_gpu_set_tensor_parallel_experts(0, 0);
+#endif
+    g_tp_peer_device = -1;
+    for (int i = tp->n_gpus - 1; i >= 0; i--) {
+        ds4_session_free(tp->sessions[i]);
+        ds4_engine_close(tp->engines[i]);
+    }
+    free(tp);
+}
+
+static struct ds4_tensor_parallel *ds4_tp_create(
+        const ds4_engine_options *opt,
+        int ctx_size,
+        char *err,
+        size_t errlen) {
+#ifndef DS4_NO_GPU
+    int n_gpus = ds4_gpu_count_devices();
+    if (n_gpus < 2) {
+        if (errlen) snprintf(err, errlen, "--tensor-parallel requires 2+ GPUs, found %d", n_gpus);
+        return NULL;
+    }
+    if (n_gpus > DS4_MAX_MGPU) n_gpus = DS4_MAX_MGPU;
+
+    ds4_engine *probe = NULL;
+    ds4_engine_options probe_opt = *opt;
+    probe_opt.inspect_only = true;
+    probe_opt.tensor_parallel = false;
+    probe_opt.skip_lock = true;
+    probe_opt.skip_gpu_init = true;
+    if (ds4_engine_open(&probe, &probe_opt) != 0 || !probe) {
+        if (errlen) snprintf(err, errlen, "TP: failed to open model for probe");
+        return NULL;
+    }
+    const uint32_t n_total_expert = DS4_N_EXPERT;
+    ds4_engine_close(probe);
+
+    if (n_total_expert < (uint32_t)n_gpus) {
+        if (errlen) snprintf(err, errlen, "TP: model has %u experts, need >= %d GPUs", n_total_expert, n_gpus);
+        return NULL;
+    }
+
+    struct ds4_tensor_parallel *tp = xcalloc(1, sizeof(*tp));
+    tp->n_gpus = n_gpus;
+    for (int i = 0; i < n_gpus; i++) {
+        tp->expert_start[i] = (uint32_t)((uint64_t)i * n_total_expert / n_gpus);
+        tp->expert_count[i] = (uint32_t)((uint64_t)(i + 1) * n_total_expert / n_gpus) - tp->expert_start[i];
+    }
+
+    for (int i = 0; i < n_gpus; i++) {
+        ds4_gpu_set_device(i);
+        ds4_engine_options slice_opt = *opt;
+        slice_opt.tensor_parallel = false;
+        slice_opt.multi_gpu = false;
+        slice_opt.load_slice = true;
+        slice_opt.load_layer_start = 0;
+        slice_opt.load_layer_end = UINT32_MAX;
+        slice_opt.load_output = true;
+        slice_opt.distributed.role = DS4_DISTRIBUTED_NONE;
+        slice_opt.distributed.layers.set = false;
+        slice_opt.skip_lock = (i > 0);
+        slice_opt.skip_gpu_init = (i > 0);
+        slice_opt.tp_expert_start = tp->expert_start[i];
+        slice_opt.tp_expert_count = tp->expert_count[i];
+
+        if (ds4_engine_open(&tp->engines[i], &slice_opt) != 0) {
+            if (errlen) snprintf(err, errlen, "TP: failed to open engine for GPU %d", i);
+            ds4_tp_free(tp);
+            return NULL;
+        }
+        if (ds4_session_create(&tp->sessions[i], tp->engines[i], ctx_size) != 0) {
+            if (errlen) snprintf(err, errlen, "TP: failed to create session for GPU %d", i);
+            ds4_engine_close(tp->engines[i]);
+            tp->engines[i] = NULL;
+            ds4_tp_free(tp);
+            return NULL;
+        }
+        if (getenv("DS4_TP_DEBUG")) ds4_gpu_print_memory_report("after session create");
+    }
+
+    fprintf(stderr, "ds4: tensor-parallel: %d GPUs, experts:", n_gpus);
+    for (int i = 0; i < n_gpus; i++)
+        fprintf(stderr, " GPU%d=%u:%u", i, tp->expert_start[i], tp->expert_start[i] + tp->expert_count[i] - 1);
+    fprintf(stderr, "\n");
+
+    ds4_gpu_set_device(0);
+    return tp;
+#else
+    (void)opt; (void)ctx_size;
+    if (errlen) snprintf(err, errlen, "tensor-parallel requires CUDA support");
+    return NULL;
+#endif
+}
+
+int ds4_session_create_tensor_parallel(ds4_session **out, const ds4_engine_options *opt, int ctx_size) {
+    if (!out || !opt || ctx_size <= 0) return 1;
+    char err[256];
+    struct ds4_tensor_parallel *tp = ds4_tp_create(opt, ctx_size, err, sizeof(err));
+    if (!tp) {
+        fprintf(stderr, "ds4: tensor-parallel session creation failed: %s\n", err);
+        return 1;
+    }
+    ds4_session *s = tp->sessions[0];
+    s->tp = tp;
+    *out = s;
+    return 0;
+}
+
+/* TP prefill: process one chunk of tokens through the two-phase pipeline. */
+static int ds4_tp_prefill_chunk(struct ds4_tensor_parallel *tp,
+                                 const int *tokens, uint32_t n_tokens, uint32_t pos0,
+                                 float *logits,
+                                 char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    const int n_gpus = tp->n_gpus;
+    ds4_tokens span = {0};
+    span.v = (int *)tokens;
+    span.len = (int)n_tokens;
+    span.cap = (int)n_tokens;
+
+    /* Upload tokens + embeddings on all GPUs (replicated) */
+    for (int i = 0; i < n_gpus; i++) {
+        ds4_gpu_set_device(i);
+        ds4_gpu_set_tensor_parallel_experts(tp->expert_start[i], tp->expert_count[i]);
+        ds4_gpu_graph *g = &tp->sessions[i]->graph;
+        const ds4_model *m = &tp->engines[i]->model;
+        const ds4_weights *w = &tp->engines[i]->weights;
+        if (!metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens) ||
+            !metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc, g->prefill_tokens,
+                                                      m, w, &span, 0, n_tokens)) {
+            snprintf(err, errlen, "TP prefill upload failed on GPU %d", i);
+            return 1;
+        }
+    }
+
+    /* Per-layer two-phase: pre-MoE+MoE → all-reduce → post-MoE */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        g_tp_skip_post_moe = true;
+        for (int i = 0; i < n_gpus; i++) {
+            ds4_gpu_set_device(i);
+            ds4_gpu_graph *g = &tp->sessions[i]->graph;
+            const ds4_model *m = &tp->engines[i]->model;
+            const ds4_weights *w = &tp->engines[i]->weights;
+            if (!ds4_gpu_begin_commands() ||
+                !metal_graph_encode_layer_batch(g, m, &w->layer[il], il, pos0, n_tokens) ||
+                !ds4_gpu_end_commands()) {
+                snprintf(err, errlen, "TP prefill phase 1 failed on GPU %d layer %u", i, il);
+                g_tp_skip_post_moe = false;
+                return 1;
+            }
+        }
+        g_tp_skip_post_moe = false;
+
+        if (n_gpus == 2) {
+            ds4_gpu_set_device(0);
+            if (!ds4_gpu_all_reduce_add(tp->sessions[0]->graph.batch_routed_out, tp->sessions[1]->graph.batch_routed_out, 1)) {
+                snprintf(err, errlen, "TP prefill all-reduce failed at layer %u", il);
+                return 1;
+            }
+            ds4_gpu_set_device(1);
+            if (!ds4_gpu_copy_from_peer(tp->sessions[1]->graph.batch_routed_out, 0,
+                                        tp->sessions[0]->graph.batch_routed_out)) {
+                snprintf(err, errlen, "TP prefill all-reduce copy failed at layer %u", il);
+                return 1;
+            }
+        }
+
+        for (int i = 0; i < n_gpus; i++) {
+            ds4_gpu_set_device(i);
+            ds4_gpu_graph *g = &tp->sessions[i]->graph;
+            const ds4_model *m = &tp->engines[i]->model;
+            const ds4_weights *w = &tp->engines[i]->weights;
+            if (!ds4_gpu_begin_commands() ||
+                !metal_graph_tp_batch_post_moe(g, m, &w->layer[il], il, pos0, n_tokens) ||
+                !ds4_gpu_end_commands()) {
+                snprintf(err, errlen, "TP prefill phase 2 failed on GPU %d layer %u", i, il);
+                return 1;
+            }
+            ds4_gpu_tensor *tmp = g->batch_cur_hc;
+            g->batch_cur_hc = g->batch_next_hc;
+            g->batch_next_hc = tmp;
+        }
+    }
+
+    /* Output head on GPU0 only */
+    ds4_gpu_set_device(0);
+    if (logits) {
+        ds4_gpu_graph *g = &tp->sessions[0]->graph;
+        const ds4_model *m = &tp->engines[0]->model;
+        const ds4_weights *w = &tp->engines[0]->weights;
+        const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+        ds4_gpu_tensor *saved_cur = g->cur_hc;
+        ds4_gpu_tensor *last_hc = metal_graph_tensor_row_view(g->batch_cur_hc, n_tokens - 1, hc_dim);
+        if (!last_hc) { snprintf(err, errlen, "TP prefill row view failed"); return 1; }
+        g->cur_hc = last_hc;
+        bool ok = ds4_gpu_begin_commands() &&
+                  metal_graph_encode_output_head(g, m, w, w->output->dim[1]) &&
+                  ds4_gpu_end_commands();
+        g->cur_hc = saved_cur;
+        ds4_gpu_tensor_free(last_hc);
+        if (!ok) { snprintf(err, errlen, "TP prefill output head failed"); return 1; }
+        if (!ds4_gpu_tensor_read(g->logits, 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+            snprintf(err, errlen, "TP prefill logits read failed");
+            return 1;
+        }
+    }
+
+    ds4_gpu_set_device(0);
+    return 0;
+#else
+    (void)tp; (void)tokens; (void)n_tokens; (void)pos0; (void)logits;
+    if (errlen) snprintf(err, errlen, "tensor-parallel requires CUDA support");
+    return 1;
+#endif
+}
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -26418,6 +26787,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+    if (s->tp) {
+        struct ds4_tensor_parallel *tp = s->tp;
+        s->tp = NULL;
+        ds4_tp_free(tp);
+        return;
+    }
     if (s->mgpu) {
         struct ds4_multi_gpu *mg = s->mgpu;
         s->mgpu = NULL;  /* prevent recursive free */
@@ -27017,6 +27392,160 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                      err,
                                      errlen);
     }
+    if (s->tp) {
+#ifndef DS4_NO_GPU
+        uint32_t pos = 0;
+        if (s->checkpoint_valid &&
+            (uint32_t)prompt->len >= (uint32_t)s->checkpoint.len &&
+            ds4_tokens_starts_with(prompt, &s->checkpoint))
+        {
+            pos = (uint32_t)s->checkpoint.len;
+        } else {
+            for (int i = 0; i < s->tp->n_gpus; i++) {
+                ds4_gpu_set_device(i);
+                ds4_session_layer_slice_reset(s->tp->sessions[i], err, errlen);
+                /* Reset checkpoint on sub-sessions */
+                s->tp->sessions[i]->checkpoint.len = 0;
+                s->tp->sessions[i]->checkpoint_valid = false;
+            }
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+            ds4_gpu_set_device(0);
+        }
+        const uint32_t chunk = s->prefill_cap;
+        while (pos < (uint32_t)prompt->len) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            uint32_t n = (uint32_t)prompt->len - pos;
+            if (n > chunk) n = chunk;
+
+            /* Process prefill one token at a time using the decode path
+             * (which has correct TP all-reduce).  The batch prefill path
+             * has issues on GPU1; per-token decode is slower but correct. */
+            for (uint32_t j = 0; j < n; j++) {
+                int tok = prompt->v[pos + j];
+                /* Run TP decode for this token (reuses the two-phase logic) */
+                g_tp_peer_device = -1;
+                g_tp_skip_post_moe = false;
+                for (int i = 0; i < s->tp->n_gpus; i++) {
+                    ds4_gpu_set_device(i);
+                    ds4_gpu_set_tensor_parallel_experts(s->tp->expert_start[i], s->tp->expert_count[i]);
+                }
+                /* Embed + per-layer two-phase + output head */
+                {
+                    const int n_gpus = s->tp->n_gpus;
+                    const uint32_t tpos = pos + j;
+                    /* Embed on all GPUs */
+                    for (int i = 0; i < n_gpus; i++) {
+                        ds4_gpu_set_device(i);
+                        ds4_gpu_graph *g = &s->tp->sessions[i]->graph;
+                        const ds4_model *m = &s->tp->engines[i]->model;
+                        const ds4_weights *w = &s->tp->engines[i]->weights;
+                        if (!ds4_gpu_begin_commands() ||
+                            !ds4_gpu_embed_token_hc_tensor(g->cur_hc, m->map, m->size,
+                                w->token_embd->abs_offset, (uint32_t)w->token_embd->dim[1],
+                                (uint32_t)tok, DS4_N_EMBD, DS4_N_HC) ||
+                            !ds4_gpu_end_commands()) {
+                            snprintf(err, errlen, "TP prefill embed failed on GPU %d", i);
+                            s->checkpoint_valid = false;
+                            return 1;
+                        }
+                    }
+                    /* Per-layer two-phase */
+                    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                        g_tp_skip_post_moe = true;
+                        for (int i = 0; i < n_gpus; i++) {
+                            ds4_gpu_set_device(i);
+                            ds4_gpu_graph *g = &s->tp->sessions[i]->graph;
+                            const ds4_model *m = &s->tp->engines[i]->model;
+                            const ds4_weights *w = &s->tp->engines[i]->weights;
+                            const uint32_t raw_row = tpos % g->raw_cap;
+                            const uint32_t n_raw = metal_graph_raw_span_for_batch(g, tpos, 1);
+                            if (!ds4_gpu_begin_commands() ||
+                                !metal_graph_encode_decode_layer(g, m, &w->layer[il], il, tpos,
+                                                                 g->layer_raw_cache[il], g->raw_cap,
+                                                                 raw_row, n_raw, tok) ||
+                                !ds4_gpu_end_commands()) {
+                                snprintf(err, errlen, "TP prefill phase 1 failed GPU %d layer %u", i, il);
+                                g_tp_skip_post_moe = false;
+                                s->checkpoint_valid = false;
+                                return 1;
+                            }
+                        }
+                        g_tp_skip_post_moe = false;
+                        if (n_gpus == 2) {
+                            ds4_gpu_set_device(0);
+                            if (!ds4_gpu_all_reduce_add(s->tp->sessions[0]->graph.routed_out,
+                                                        s->tp->sessions[1]->graph.routed_out, 1)) {
+                                snprintf(err, errlen, "TP prefill all-reduce failed layer %u", il);
+                                s->checkpoint_valid = false;
+                                return 1;
+                            }
+                            ds4_gpu_set_device(1);
+                            if (!ds4_gpu_copy_from_peer(s->tp->sessions[1]->graph.routed_out, 0,
+                                                        s->tp->sessions[0]->graph.routed_out)) {
+                                snprintf(err, errlen, "TP prefill all-reduce copy failed layer %u", il);
+                                s->checkpoint_valid = false;
+                                return 1;
+                            }
+                        }
+                        for (int i = 0; i < n_gpus; i++) {
+                            ds4_gpu_set_device(i);
+                            ds4_gpu_graph *g = &s->tp->sessions[i]->graph;
+                            const ds4_model *m = &s->tp->engines[i]->model;
+                            const ds4_weights *w = &s->tp->engines[i]->weights;
+                            if (!ds4_gpu_begin_commands() ||
+                                !metal_graph_tp_decode_post_moe(g, m, &w->layer[il], il, tpos) ||
+                                !ds4_gpu_end_commands()) {
+                                snprintf(err, errlen, "TP prefill phase 2 failed GPU %d layer %u", i, il);
+                                s->checkpoint_valid = false;
+                                return 1;
+                            }
+                            ds4_gpu_tensor *tmp = g->cur_hc;
+                            g->cur_hc = g->after_ffn_hc;
+                            g->after_ffn_hc = tmp;
+                        }
+                    }
+                    /* Output head on GPU0 for last token of chunk */
+                    if (j == n - 1 && s->logits) {
+                        ds4_gpu_set_device(0);
+                        ds4_gpu_graph *g = &s->tp->sessions[0]->graph;
+                        const ds4_model *m = &s->tp->engines[0]->model;
+                        const ds4_weights *w = &s->tp->engines[0]->weights;
+                        if (!ds4_gpu_begin_commands() ||
+                            !metal_graph_encode_output_head(g, m, w, w->output->dim[1]) ||
+                            !ds4_gpu_end_commands() ||
+                            !ds4_gpu_tensor_read(g->logits, 0, s->logits, DS4_N_VOCAB * sizeof(float))) {
+                            snprintf(err, errlen, "TP prefill output head failed");
+                            s->checkpoint_valid = false;
+                            return 1;
+                        }
+                    }
+                }
+                /* Update checkpoints */
+                for (int i = 0; i < s->tp->n_gpus; i++) {
+                    token_vec_push(&s->tp->sessions[i]->checkpoint, tok);
+                    s->tp->sessions[i]->checkpoint_valid = true;
+                }
+                token_vec_push(&s->checkpoint, tok);
+                s->checkpoint_valid = true;
+            }
+
+            if (s->progress)
+                s->progress(s->progress_ud, "prefill_chunk", pos + n, prompt->len);
+            pos += n;
+        }
+        ds4_gpu_set_device(0);
+        return 0;
+#else
+        (void)prompt;
+        if (errlen) snprintf(err, errlen, "tensor-parallel requires CUDA support");
+        return 1;
+#endif
+    }
     if (s->mgpu) {
         /* Multi-GPU prefill: process the prompt in chunks through the GPU
          * pipeline.
@@ -27425,6 +27954,139 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (s->tp) {
+#ifndef DS4_NO_GPU
+        if (!s->checkpoint_valid) {
+            if (errlen) snprintf(err, errlen, "tensor-parallel decode requires a valid checkpoint");
+            return 1;
+        }
+        (void)probe_mtp;
+        {
+            const int n_gpus = s->tp->n_gpus;
+            const uint32_t pos = (uint32_t)s->checkpoint.len;
+
+            /* Embed token on all GPUs (replicated) */
+            for (int i = 0; i < n_gpus; i++) {
+                ds4_gpu_set_device(i);
+                ds4_gpu_set_tensor_parallel_experts(s->tp->expert_start[i], s->tp->expert_count[i]);
+                ds4_gpu_graph *g = &s->tp->sessions[i]->graph;
+                const ds4_model *m = &s->tp->engines[i]->model;
+                const ds4_weights *w = &s->tp->engines[i]->weights;
+                if (!ds4_gpu_begin_commands() ||
+                    !ds4_gpu_embed_token_hc_tensor(g->cur_hc, m->map, m->size,
+                        w->token_embd->abs_offset, (uint32_t)w->token_embd->dim[1],
+                        (uint32_t)token, DS4_N_EMBD, DS4_N_HC) ||
+                    !ds4_gpu_end_commands()) {
+                    snprintf(err, errlen, "TP embed failed on GPU %d", i);
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+            }
+
+            /* Per-layer two-phase: pre-MoE+MoE → all-reduce → post-MoE */
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                /* Phase 1: run decode layer with post-MoE skipped */
+                g_tp_skip_post_moe = true;
+                for (int i = 0; i < n_gpus; i++) {
+                    ds4_gpu_set_device(i);
+                    ds4_gpu_graph *g = &s->tp->sessions[i]->graph;
+                    const ds4_model *m = &s->tp->engines[i]->model;
+                    const ds4_weights *w = &s->tp->engines[i]->weights;
+                    const uint32_t raw_row = pos % g->raw_cap;
+                    const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+                    if (!ds4_gpu_begin_commands() ||
+                        !metal_graph_encode_decode_layer(g, m, &w->layer[il], il, pos,
+                                                         g->layer_raw_cache[il], g->raw_cap,
+                                                         raw_row, n_raw, token) ||
+                        !ds4_gpu_end_commands()) {
+                        snprintf(err, errlen, "TP decode phase 1 failed on GPU %d layer %u", i, il);
+                        g_tp_skip_post_moe = false;
+                        s->checkpoint_valid = false;
+                        return 1;
+                    }
+                }
+                g_tp_skip_post_moe = false;
+
+                /* All-reduce routed_out across GPUs */
+                if (n_gpus == 2) {
+                    /* Debug: print routed_out before all-reduce */
+                    if (getenv("DS4_TP_DEBUG") && il == 0) {
+                        float dbg[5] = {0};
+                        ds4_gpu_set_device(0);
+                        ds4_gpu_tensor_read(s->tp->sessions[0]->graph.routed_out, 0, dbg, sizeof(dbg));
+                        fprintf(stderr, "ds4: TP layer 0 GPU0 routed_out before AR: %f %f %f %f %f\n",
+                                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4]);
+                        ds4_gpu_set_device(1);
+                        ds4_gpu_tensor_read(s->tp->sessions[1]->graph.routed_out, 0, dbg, sizeof(dbg));
+                        fprintf(stderr, "ds4: TP layer 0 GPU1 routed_out before AR: %f %f %f %f %f\n",
+                                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4]);
+                    }
+                    /* GPU0 computes sum, then copy result to GPU1 */
+                    ds4_gpu_set_device(0);
+                    if (!ds4_gpu_all_reduce_add(s->tp->sessions[0]->graph.routed_out, s->tp->sessions[1]->graph.routed_out, 1)) {
+                        snprintf(err, errlen, "TP all-reduce failed at layer %u", il);
+                        s->checkpoint_valid = false;
+                        return 1;
+                    }
+                    /* Debug: print routed_out after all-reduce */
+                    if (getenv("DS4_TP_DEBUG") && il == 0) {
+                        float dbg[5] = {0};
+                        ds4_gpu_tensor_read(s->tp->sessions[0]->graph.routed_out, 0, dbg, sizeof(dbg));
+                        fprintf(stderr, "ds4: TP layer 0 GPU0 routed_out after AR:  %f %f %f %f %f\n",
+                                dbg[0], dbg[1], dbg[2], dbg[3], dbg[4]);
+                    }
+                    ds4_gpu_set_device(1);
+                    if (!ds4_gpu_copy_from_peer(s->tp->sessions[1]->graph.routed_out, 0,
+                                                s->tp->sessions[0]->graph.routed_out)) {
+                        snprintf(err, errlen, "TP all-reduce copy failed at layer %u", il);
+                        s->checkpoint_valid = false;
+                        return 1;
+                    }
+                }
+
+                /* Phase 2: post-MoE + swap */
+                for (int i = 0; i < n_gpus; i++) {
+                    ds4_gpu_set_device(i);
+                    ds4_gpu_graph *g = &s->tp->sessions[i]->graph;
+                    const ds4_model *m = &s->tp->engines[i]->model;
+                    const ds4_weights *w = &s->tp->engines[i]->weights;
+                    if (!ds4_gpu_begin_commands() ||
+                        !metal_graph_tp_decode_post_moe(g, m, &w->layer[il], il, pos) ||
+                        !ds4_gpu_end_commands()) {
+                        snprintf(err, errlen, "TP decode phase 2 failed on GPU %d layer %u", i, il);
+                        s->checkpoint_valid = false;
+                        return 1;
+                    }
+                    ds4_gpu_tensor *tmp = g->cur_hc;
+                    g->cur_hc = g->after_ffn_hc;
+                    g->after_ffn_hc = tmp;
+                }
+            }
+
+            /* Output head on GPU0 only */
+            ds4_gpu_set_device(0);
+            if (s->logits) {
+                ds4_gpu_graph *g = &s->tp->sessions[0]->graph;
+                const ds4_model *m = &s->tp->engines[0]->model;
+                const ds4_weights *w = &s->tp->engines[0]->weights;
+                if (!ds4_gpu_begin_commands() ||
+                    !metal_graph_encode_output_head(g, m, w, w->output->dim[1]) ||
+                    !ds4_gpu_end_commands() ||
+                    !ds4_gpu_tensor_read(g->logits, 0, s->logits, DS4_N_VOCAB * sizeof(float))) {
+                    snprintf(err, errlen, "TP output head failed");
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+            }
+        }
+        ds4_gpu_set_device(0);
+        return 0;
+#else
+        (void)token; (void)probe_mtp;
+        if (errlen) snprintf(err, errlen, "tensor-parallel requires CUDA support");
+        return 1;
+#endif
+    }
     if (s->mgpu) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "multi-GPU decode requires a valid checkpoint");

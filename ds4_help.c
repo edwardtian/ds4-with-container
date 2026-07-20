@@ -180,6 +180,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
         if (tool == DS4_HELP_SERVER || tool == DS4_HELP_DS4) {
             opt(fp, c, "--multi-gpu", "CUDA: split model layers across all available GPUs (pipeline parallel).");
+            opt(fp, c, "--tensor-parallel", "CUDA: shard MoE experts across GPUs (tensor parallel, all GPUs see all layers).");
         }
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");

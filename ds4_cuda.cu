@@ -88,6 +88,13 @@ static int g_model_mapping_failure_notice_printed;
 static int g_quality_mode;
 static int g_ssd_streaming_mode;
 
+/* Tensor-parallel expert sharding: when g_tp_expert_count > 0, the MoE
+ * kernel zeroes the routing weight for any selected expert outside
+ * [g_tp_expert_start, g_tp_expert_start + g_tp_expert_count).  This
+ * makes each GPU's partial MoE output correct for all-reduce. */
+static uint32_t g_tp_expert_start = 0;
+static uint32_t g_tp_expert_count = 0;
+
 struct cuda_model_range {
     const void *host_base;
     uint64_t offset;
@@ -2481,6 +2488,7 @@ extern "C" void ds4_gpu_cleanup(void) {
 }
 
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v);
+__global__ static void add_f32_kernel(float *dst, const float *src, uint64_t n);
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (bytes == 0) bytes = 1;
@@ -2910,6 +2918,74 @@ extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
         cuda_stream_selected_cache_release();
         cuda_stream_expert_cache_release_all();
     }
+}
+
+extern "C" void ds4_gpu_set_tensor_parallel_experts(uint32_t expert_start, uint32_t expert_count) {
+    g_tp_expert_start = expert_start;
+    g_tp_expert_count = expert_count;
+}
+
+extern "C" int ds4_gpu_all_reduce_add(ds4_gpu_tensor *local, const ds4_gpu_tensor *peer, int peer_device) {
+    if (!local || !peer || g_n_devs < 2 || peer_device < 0 || peer_device >= g_n_devs || peer_device == g_cur_dev)
+        return 1;
+    if (local->bytes < peer->bytes) return 0;
+    const uint64_t bytes = peer->bytes;
+    ds4_gpu_tensor *peer_copy = ds4_gpu_tensor_alloc(bytes);
+    if (!peer_copy) return 0;
+    /* Copy peer's tensor from peer_device to current device.
+     * Peer-to-peer copy may silently fail on some setups, so always use
+     * host bounce for reliability. */
+    {
+        void *host_buf = malloc(bytes);
+        if (!host_buf) { ds4_gpu_tensor_free(peer_copy); return 0; }
+        int saved = g_cur_dev;
+        cudaSetDevice(peer_device);
+        cudaMemcpy(host_buf, peer->ptr, bytes, cudaMemcpyDeviceToHost);
+        cudaSetDevice(saved);
+        cudaMemcpy(peer_copy->ptr, host_buf, bytes, cudaMemcpyHostToDevice);
+        free(host_buf);
+    }
+    /* Add peer's copy to our local tensor */
+    if (getenv("DS4_TP_DEBUG")) {
+        float dbg[3] = {0};
+        cudaMemcpy(dbg, peer_copy->ptr, sizeof(dbg), cudaMemcpyDeviceToHost);
+        float dbl[3] = {0};
+        cudaMemcpy(dbl, local->ptr, sizeof(dbl), cudaMemcpyDeviceToHost);
+        fprintf(stderr, "ds4: TP AR GPU %d: peer_copy=%f %f %f local=%f %f %f\n",
+                g_cur_dev, dbg[0], dbg[1], dbg[2], dbl[0], dbl[1], dbl[2]);
+    }
+    if (getenv("DS4_TP_DEBUG")) fprintf(stderr, "ds4: TP all-reduce on GPU %d: %llu bytes\n", g_cur_dev, (unsigned long long)bytes);
+    /* Use a simple element-wise add kernel */
+    {
+        const uint64_t n = bytes / sizeof(float);
+        const int threads = 256;
+        const int blocks = (int)((n + threads - 1) / threads);
+        add_f32_kernel<<<blocks, threads>>>((float *)local->ptr, (const float *)peer_copy->ptr, n);
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: all-reduce add kernel failed: %s\n", cudaGetErrorString(err));
+            ds4_gpu_tensor_free(peer_copy);
+            return 0;
+        }
+    }
+    ds4_gpu_tensor_free(peer_copy);
+    return 1;
+}
+
+extern "C" int ds4_gpu_copy_from_peer(ds4_gpu_tensor *dst, int peer_device, const ds4_gpu_tensor *src) {
+    if (!dst || !src || g_n_devs < 2 || peer_device < 0 || peer_device >= g_n_devs || peer_device == g_cur_dev)
+        return 0;
+    if (dst->bytes < src->bytes) return 0;
+    /* Always use host bounce for reliability */
+    void *host = malloc(src->bytes);
+    if (!host) return 0;
+    int saved = g_cur_dev;
+    cudaSetDevice(peer_device);
+    cudaMemcpy(host, src->ptr, src->bytes, cudaMemcpyDeviceToHost);
+    cudaSetDevice(saved);
+    cudaMemcpy(dst->ptr, host, src->bytes, cudaMemcpyHostToDevice);
+    free(host);
+    return 1;
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
@@ -5925,6 +6001,32 @@ __global__ static void output_hc_weights_kernel(
 __global__ static void fill_f32_kernel(float *x, uint64_t n, float v) {
     uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[i] = v;
+}
+
+__global__ static void add_f32_kernel(float *dst, const float *src, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += src[i];
+}
+
+/* Zero routing weights for non-local experts and remap local expert
+ * indices from global to local (subtract tp_start).  Without remapping,
+ * local expert indices (e.g. 200 on GPU1) would exceed the local
+ * n_total_expert (128) and cause out-of-bounds access. */
+__global__ static void moe_tp_filter_weights_kernel(
+        float *weights, int32_t *selected,
+        uint32_t n_expert, uint64_t n_pairs,
+        uint32_t tp_start, uint32_t tp_count) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_pairs) return;
+    int32_t expert = selected[idx];
+    if (expert < (int32_t)tp_start || expert >= (int32_t)(tp_start + tp_count)) {
+        /* Non-local expert: zero its routing weight */
+        weights[idx] = 0.0f;
+        selected[idx] = 0;  /* redirect to first local expert */
+    } else {
+        /* Local expert: remap from global index to local index */
+        selected[idx] = expert - (int32_t)tp_start;
+    }
 }
 
 __global__ static void compressor_store_kernel(
@@ -12396,6 +12498,12 @@ static int routed_moe_launch(
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
     if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    /* Tensor-parallel: the tensor's abs_offset is already sharded by
+     * weights_bind, but n_total_expert comes from the forward pass as
+     * DS4_N_EXPERT (256).  Override it with the local count. */
+    if (g_tp_expert_count > 0) {
+        n_total_expert = g_tp_expert_count;
+    }
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
@@ -12435,6 +12543,34 @@ static int routed_moe_launch(
         ? g_stream_selected_cache.down_ptr
         : cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
+
+    /* Tensor-parallel: zero routing weights for non-local experts so their
+     * MoE contribution is zero, making the partial output correct for
+     * all-reduce across GPUs.  The weights tensor is recomputed by the
+     * router on every call, so in-place modification is safe. */
+    if (g_tp_expert_count > 0 && weights) {
+        const uint64_t n_pairs = (uint64_t)n_tokens * n_expert;
+        if (!weights->ptr || !selected_tensor->ptr ||
+            weights->bytes < n_pairs * sizeof(float) ||
+            selected_tensor->bytes < n_pairs * sizeof(int32_t)) {
+            fprintf(stderr, "ds4: TP filter: invalid tensor on GPU %d\n", g_cur_dev);
+            return 0;
+        }
+        const uint32_t threads = 256;
+        const uint32_t blocks = (uint32_t)((n_pairs + threads - 1) / threads);
+        moe_tp_filter_weights_kernel<<<blocks, threads>>>(
+            (float *)weights->ptr,
+            (int32_t *)selected_tensor->ptr,
+            n_expert, n_pairs,
+            g_tp_expert_start, g_tp_expert_count);
+        /* Ensure filter completes before MoE kernel reads the modified tensors */
+        cudaError_t tp_err = cudaStreamSynchronize(0);
+        if (tp_err != cudaSuccess) {
+            fprintf(stderr, "ds4: TP weight filter kernel failed on GPU %d: %s\n",
+                    g_cur_dev, cudaGetErrorString(tp_err));
+            return 0;
+        }
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;

@@ -114,8 +114,11 @@ typedef struct {
     bool ssd_streaming_cold;
     bool inspect_only;
     bool multi_gpu;
+    bool tensor_parallel;
     bool skip_lock;
     bool skip_gpu_init;
+    uint32_t tp_expert_start;   /* TP: first expert on this GPU */
+    uint32_t tp_expert_count;   /* TP: number of experts on this GPU */
     bool load_slice;
     uint32_t load_layer_start;
     uint32_t load_layer_end;
@@ -222,6 +225,7 @@ int ds4_token_assistant(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 int ds4_session_create_multi_gpu(ds4_session **out, const ds4_engine_options *opt, int ctx_size);
+int ds4_session_create_tensor_parallel(ds4_session **out, const ds4_engine_options *opt, int ctx_size);
 ds4_engine *ds4_session_engine(ds4_session *s);
 void ds4_session_free(ds4_session *s);
 int ds4_session_power(ds4_session *s);

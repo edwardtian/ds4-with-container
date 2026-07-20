@@ -75,6 +75,9 @@ int ds4_gpu_preload_q4_expert_tables(const void *model_map, uint64_t model_size,
                                      uint32_t n_total_expert);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
+void ds4_gpu_set_tensor_parallel_experts(uint32_t expert_start, uint32_t expert_count);
+int ds4_gpu_all_reduce_add(ds4_gpu_tensor *local, const ds4_gpu_tensor *peer, int peer_device);
+int ds4_gpu_copy_from_peer(ds4_gpu_tensor *dst, int peer_device, const ds4_gpu_tensor *src);
 void ds4_gpu_set_ssd_streaming(bool enabled);
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);

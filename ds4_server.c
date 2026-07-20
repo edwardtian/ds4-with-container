@@ -11655,6 +11655,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--multi-gpu")) {
             c.engine.multi_gpu = true;
+        } else if (!strcmp(arg, "--tensor-parallel")) {
+            c.engine.tensor_parallel = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
 #ifdef DS4_ROCM_BUILD
@@ -11719,6 +11721,13 @@ int main(int argc, char **argv) {
     if (cfg.engine.multi_gpu) {
         if (ds4_session_create_multi_gpu(&session, &cfg.engine, cfg.ctx_size) != 0) {
             server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create multi-GPU session");
+            return 1;
+        }
+        engine = ds4_session_engine(session);
+        engine_owned_by_session = true;
+    } else if (cfg.engine.tensor_parallel) {
+        if (ds4_session_create_tensor_parallel(&session, &cfg.engine, cfg.ctx_size) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to create tensor-parallel session");
             return 1;
         }
         engine = ds4_session_engine(session);
