@@ -54446,6 +54446,17 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
             if (e->placement[i] == DS4_LAYER_PACK_CPU) { multi_tier = 1; break; }
         }
     }
+    /* CUDA tensor parallelism uses the partner tiers (home + n_gpus/2) as
+     * expert/output-shard residences even when there is only one pipeline
+     * stage (n_gpus == 2), so every layer's home is tier 0 and the diversity
+     * scan above sees a single tier. Force the multi-tier sharded load path
+     * on in that case; otherwise the single-tier path cudaMalloc's the whole
+     * model onto GPU 0 and OOMs on cards that cannot hold it alone. The
+     * per-device cache installer routes the partner's expert half to
+     * logical_tier + n_gpus/2, which is valid for any even n_gpus >= 2. */
+    if (!multi_tier && engine_cuda_tp_decode_requested(e)) {
+        multi_tier = 1;
+    }
     e->multi_tier = multi_tier;
     return 0;
 }

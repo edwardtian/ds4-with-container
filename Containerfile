@@ -35,7 +35,7 @@ ENV LD_LIBRARY_PATH=${CUDA_HOME}/lib64:${LD_LIBRARY_PATH}
 WORKDIR /app
 
 # Copy project source files
-COPY *.c *.h *.cu *.m *.sh Makefile /app/
+COPY *.c *.h *.cu *.m *.sh *.inc Makefile /app/
 COPY linenoise.c linenoise.h /app/
 COPY rax.c rax.h rax_malloc.h /app/
 COPY ds4_iq2_tables_cuda.inc ds4_streaming_hotlist.inc /app/

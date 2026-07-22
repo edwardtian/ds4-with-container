@@ -639,6 +639,59 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
     restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
 }
 
+/* A 2-GPU CUDA TP topology is a single pipeline stage: every layer's home
+ * is tier 0 and tier 1 is only the expert/output-shard partner. The
+ * placement diversity scan alone would classify this as single-tier and
+ * then cudaMalloc the whole model onto GPU 0. The engine must instead
+ * force the multi-tier sharded load path on so each card holds ~half the
+ * routed experts. */
+static void test_cuda_tp_two_gpu_is_multitier(void) {
+    fprintf(stderr, "RUN: test_cuda_tp_two_gpu_is_multitier\n");
+    ds4_test_fake_tensor tensors[DS4_N_LAYER_LOCAL + 2];
+    int n = build_output_tp_head_move_model(tensors,
+                                            (int)(sizeof(tensors) / sizeof(tensors[0])));
+    CHECK(n > 0, "two-gpu TP synthetic model built");
+    if (n <= 0) return;
+
+    char *old_pipe = save_env_value("DS4_CUDA_PREFILL_PIPELINE");
+    char *old_chunk = save_env_value("DS4_METAL_PREFILL_CHUNK");
+    unsetenv("DS4_CUDA_PREFILL_PIPELINE");
+    unsetenv("DS4_METAL_PREFILL_CHUNK");
+
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    for (int i = 0; i < cfg.n_gpus; i++) {
+        cfg.device_indices[i] = i;
+        cfg.vram_bytes[i] = (size_t)88ull * 1024ull * 1024ull * 1024ull;
+    }
+    cfg.safety_margin_bytes = (size_t)512ull * 1024ull * 1024ull;
+
+    int placement[DS4_N_ENTRIES] = {0};
+    int multi_tier = 0;
+    int n_entries = 0;
+    int rc = ds4_test_classify_multi_tier_with_ctx_cuda_tp(tensors,
+                                                           n,
+                                                           &cfg,
+                                                           4096,
+                                                           placement,
+                                                           &multi_tier,
+                                                           &n_entries);
+    CHECK(rc == 0, "two-gpu CUDA TP classify succeeds");
+    CHECK(multi_tier == 1,
+          "two-gpu CUDA TP is multi-tier (sharded load path)");
+    CHECK(n_entries == DS4_N_ENTRIES, "two-gpu CUDA TP n_entries");
+    int all_home_zero = 1;
+    for (int i = 0; i <= (int)DS4_N_LAYER_LOCAL; i++) {
+        if (placement[i] != 0) { all_home_zero = 0; break; }
+    }
+    CHECK(all_home_zero,
+          "single pipeline stage homes every layer + embedding on tier 0");
+
+    restore_env_value("DS4_CUDA_PREFILL_PIPELINE", old_pipe);
+    restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
@@ -651,6 +704,7 @@ int main(void) {
     test_glm_per_layer_cache_accounting();
     test_cuda_tp_prefill_default_accounting();
     test_cuda_tp_output_head_moves_to_lower_half();
+    test_cuda_tp_two_gpu_is_multitier();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
             g_checks - g_failures, g_checks, g_failures);

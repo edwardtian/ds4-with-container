@@ -5,9 +5,9 @@ set -e
 # Reuses the local CUDA installer and expects models to be mounted at runtime.
 
 echo "Building ds4-cuda container..."
-podman build -f Containerfile -t ds4-cuda:latest "$@"
+podman build -f Containerfile -t ds4-cuda-tp:latest "$@"
 
-echo "Build complete. Image: ds4-cuda:latest"
+echo "Build complete. Image: ds4-cuda-tp:latest"
 echo ""
 echo "To run the server with your local model:"
 echo "  ./run_container.sh"
